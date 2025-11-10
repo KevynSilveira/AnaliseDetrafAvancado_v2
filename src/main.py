@@ -19,7 +19,18 @@ def ip_local():
 def start_api():
     req = API / "requirements.txt"
     if req.exists():
-        subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req)], check=False)
+        log_dir = ROOT.parent / "var" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "pip_requirements.log"
+        with open(log_path, "a") as log:
+            log.write("\n=== Instalação de requisitos (pip) ===\n")
+            log.flush()
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", str(req)],
+                check=False,
+                stdout=log,
+                stderr=log,
+            )
     return subprocess.Popen([sys.executable, "-m", "uvicorn", "src.api.server:app", "--host", "0.0.0.0", "--port", "8000", "--reload"])
 
 def start_web():

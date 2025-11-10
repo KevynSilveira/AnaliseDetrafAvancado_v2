@@ -20,8 +20,12 @@ export const api = {
   post: (p, data) => request(p, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) }),
   upload: (p, file, fields={}) => {
     const form = new FormData();
-    form.append('file', file);
+    form.append('arquivo', file);
     Object.entries(fields).forEach(([k,v]) => form.append(k, v));
     return request(p, { method:'POST', body: form });
-  }
+  },
+  delete: (p) => request(p, { method:'DELETE' }),
+  put: (p, data) => request(p, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) }),
 };
+
+export const API_BASE = BASE;

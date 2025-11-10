@@ -4,6 +4,7 @@ import { Routes, Route, NavLink } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import Imports from "./pages/Imports";
 import Reports from "./pages/Reports";
+import Configuracoes from "./pages/Configuracoes";
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
             <NavLink to="/" end className={({isActive}) => isActive ? "text-white" : "link"}>Dashboard</NavLink>
             <NavLink to="/importacoes" className={({isActive}) => isActive ? "text-white" : "link"}>Importações</NavLink>
             <NavLink to="/relatorios" className={({isActive}) => isActive ? "text-white" : "link"}>Relatórios</NavLink>
+            <NavLink to="/configuracoes" className={({isActive}) => isActive ? "text-white" : "link"}>Configurações</NavLink>
           </div>
         </div>
       </nav>
@@ -27,6 +29,7 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/importacoes" element={<Imports />} />
           <Route path="/relatorios" element={<Reports />} />
+          <Route path="/configuracoes" element={<Configuracoes />} />
         </Routes>
       </main>
     </div>
