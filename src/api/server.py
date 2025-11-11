@@ -941,14 +941,24 @@ def listar_conferencia_importacoes():
                    cli.nome_cliente,
                    COALESCE(SUM(CASE WHEN cr.status = 'CONFERIDO' THEN 1 ELSE 0 END), 0) AS conferidos,
                    COALESCE(SUM(CASE WHEN cr.status = 'DIVERGENTE' THEN 1 ELSE 0 END), 0) AS divergentes,
-                   COALESCE(SUM(CASE WHEN cr.status = 'PERDIDO' THEN 1 ELSE 0 END), 0) AS perdidos
+                   COALESCE(SUM(CASE WHEN cr.status = 'PERDIDO' THEN 1 ELSE 0 END), 0) AS perdidos,
+                   gh.seg_reduz_cob AS seg_reduzidos_cobrados,
+                   gh.seg_reduz_val AS seg_reduzidos_validados
             FROM controle_importacoes ci
             INNER JOIN clientes cli ON cli.id_cliente = ci.id_cliente
             LEFT JOIN conferencia_resultados cr ON cr.id_importacao_detraf = ci.id
+            LEFT JOIN (
+                SELECT id_importacao,
+                       SUM(CASE WHEN gh = 'R' THEN duracao_segundos ELSE 0 END) AS seg_reduz_cob,
+                       SUM(segundos_gh_reduzido) AS seg_reduz_val
+                FROM detraf_normalizado
+                GROUP BY id_importacao
+            ) gh ON gh.id_importacao = ci.id
             WHERE ci.tipo_arquivo = 'DETRAF'
               AND ci.status <> 'REMOVIDO'
             GROUP BY ci.id, ci.id_cliente, ci.nome_arquivo, ci.periodo_inicial, ci.periodo_final,
-                     ci.eqt_credora, ci.eqt_devedora, ci.linhas_processadas, cli.nome_cliente
+                     ci.eqt_credora, ci.eqt_devedora, ci.linhas_processadas, cli.nome_cliente,
+                     gh.seg_reduz_cob, gh.seg_reduz_val
             ORDER BY ci.data_importacao DESC, ci.id DESC
             LIMIT 50
             """
@@ -958,6 +968,8 @@ def listar_conferencia_importacoes():
             conferidos = int(linha.get("conferidos") or 0)
             divergentes = int(linha.get("divergentes") or 0)
             perdidos = int(linha.get("perdidos") or 0)
+            seg_reduz_cob = int(linha.get("seg_reduzidos_cobrados") or 0)
+            seg_reduz_val = int(linha.get("seg_reduzidos_validados") or 0)
             total_resultados = conferidos + divergentes + perdidos
             processadas = int(linha.get("linhas_processadas") or total_resultados)
             percentual = round((conferidos / processadas * 100), 1) if processadas else 0.0
@@ -977,6 +989,8 @@ def listar_conferencia_importacoes():
                     "perdidos": perdidos,
                     "percentual_conferido": percentual,
                     "tem_resultados": total_resultados > 0,
+                    "segundos_reduzidos_cobrados": seg_reduz_cob,
+                    "segundos_reduzidos_validados": seg_reduz_val,
                 }
             )
         return resposta
@@ -1087,6 +1101,24 @@ def obter_conferencia_resumo(id_importacao: int):
         )
         sem_cdr = int(cursor.fetchone()["total"] or 0)
 
+        cursor.execute(
+            """
+            SELECT
+                SUM(CASE WHEN gh = 'R' THEN duracao_segundos ELSE 0 END) AS seg_reduz_cob,
+                SUM(segundos_gh_normal) AS seg_normal_val,
+                SUM(segundos_gh_reduzido) AS seg_reduz_val
+            FROM detraf_normalizado
+            WHERE id_importacao = %s
+            """,
+            (id_importacao,),
+        )
+        metrica = cursor.fetchone() or {}
+        gh_metricas = {
+            "segundos_reduzidos_cobrados": int(metrica.get("seg_reduz_cob") or 0),
+            "segundos_reduzidos_validados": int(metrica.get("seg_reduz_val") or 0),
+            "segundos_normais_validados": int(metrica.get("seg_normal_val") or 0),
+        }
+
         return {
             "importacao": {
                 "id": info["id"],
@@ -1110,6 +1142,7 @@ def obter_conferencia_resumo(id_importacao: int):
                 "descritor": descritores,
                 "gh": ghs,
             },
+            "gh_metricas": gh_metricas,
         }
     finally:
         conexao.close()

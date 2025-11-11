@@ -41,6 +41,11 @@ const StatusBadge = ({ status }) => {
 };
 
 const formatarNumero = (valor) => Number(valor || 0).toLocaleString("pt-BR");
+const formatarMinutos = (segundos) => {
+  if (segundos === null || segundos === undefined) return "--";
+  const minutos = segundos / 60;
+  return minutos % 1 === 0 ? `${minutos}` : minutos.toFixed(1);
+};
 const formatarDelta = (valor) => {
   if (valor === null || valor === undefined) return "--";
   const minutos = (Number(valor) / 60).toFixed(1);
@@ -75,6 +80,13 @@ export default function Validacao() {
   const [statusProcesso, setStatusProcesso] = useState("");
   const [execucaoId, setExecucaoId] = useState("");
   const [statusExecucao, setStatusExecucao] = useState(null);
+
+  const segmentosGhDetalhe = detalheDados?.detraf?.segmentos_gh || [];
+  const possuiGhNormal = segmentosGhDetalhe.some((seg) => seg.gh === "N");
+  const possuiGhReduzido = segmentosGhDetalhe.some((seg) => seg.gh === "R");
+  const possuiTrocaGh = segmentosGhDetalhe.some((seg, idx) => idx > 0 && seg.gh !== segmentosGhDetalhe[idx - 1].gh);
+  const mostrarDistribuicaoGh =
+    segmentosGhDetalhe.length > 1 && possuiGhNormal && possuiGhReduzido && possuiTrocaGh;
 
   const totalPaginas = Math.max(1, Math.ceil(total / porPagina));
   const faixaInicio = total ? (pagina - 1) * porPagina + 1 : 0;
@@ -350,6 +362,13 @@ export default function Validacao() {
       if (detalhesNormalizados && !Array.isArray(detalhesNormalizados.detalhes_divergencia)) {
         detalhesNormalizados.detalhes_divergencia = [];
       }
+      if (detalhesNormalizados?.detraf?.segmentos_gh && !Array.isArray(detalhesNormalizados.detraf.segmentos_gh)) {
+        try {
+          detalhesNormalizados.detraf.segmentos_gh = JSON.parse(detalhesNormalizados.detraf.segmentos_gh);
+        } catch {
+          detalhesNormalizados.detraf.segmentos_gh = [];
+        }
+      }
       setDetalheDados(detalhesNormalizados);
     } catch (erro) {
       setErroDetalhe(erro.message || "Falha ao carregar os detalhes da chamada.");
@@ -513,6 +532,23 @@ export default function Validacao() {
             </div>
           );
         })}
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="rounded-xl border border-neutral-700 bg-neutral-900 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-400">Minutos reduzidos cobrados</p>
+          <p className="mt-2 text-2xl font-semibold text-white">
+            {carregandoResumo ? "--" : formatarMinutos(resumo?.gh_metricas?.segundos_reduzidos_cobrados)}
+          </p>
+          <p className="text-xs text-gray-500">Total informado pela operadora</p>
+        </div>
+        <div className="rounded-xl border border-neutral-700 bg-neutral-900 p-4">
+          <p className="text-xs uppercase tracking-wide text-gray-400">Minutos reduzidos validados</p>
+          <p className="mt-2 text-2xl font-semibold text-emerald-400">
+            {carregandoResumo ? "--" : formatarMinutos(resumo?.gh_metricas?.segundos_reduzidos_validados)}
+          </p>
+          <p className="text-xs text-gray-500">Total identificado pela conferência</p>
+        </div>
       </div>
 
       <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4 space-y-4">
@@ -689,214 +725,268 @@ export default function Validacao() {
       )}
 
       {detalheAberto && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="w-full max-w-5xl rounded-2xl border border-neutral-700 bg-neutral-950 p-6 shadow-2xl">
-            <div className="flex items-center justify-between border-b border-neutral-800 pb-4">
-              <div>
-                <h3 className="text-lg font-semibold text-white">Detalhes da chamada</h3>
-                {detalheDados && (
-                  <p className="text-xs text-gray-400">
-                    Resultado #{detalheDados.id} • Status: {detalheDados.status}
-                  </p>
-                )}
-              </div>
-              <button className="text-sm text-gray-400 hover:text-white" onClick={fecharDetalhes}>
-                Fechar ✕
-              </button>
-            </div>
-
-            {carregandoDetalhe && (
-              <div className="py-8 text-center text-sm text-gray-300">Carregando detalhes...</div>
-            )}
-
-            {!carregandoDetalhe && erroDetalhe && (
-              <div className="py-6 text-center text-sm text-red-400">{erroDetalhe}</div>
-            )}
-
-            {!carregandoDetalhe && !erroDetalhe && detalheDados && (
-              <>
-              <div className="mt-4 grid gap-6 md:grid-cols-2">
-                <div className="space-y-3 rounded-xl border border-neutral-800 bg-neutral-900 p-4">
-                  <h4 className="text-sm font-semibold text-primary">DETRAF</h4>
-                  <dl className="space-y-1 text-xs text-gray-300">
-                    <div className="flex justify-between">
-                      <dt>Sequencial</dt>
-                      <dd>{detalheDados.detraf?.sequencial || "--"}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>Data/Hora</dt>
-                      <dd>
-                        {detalheDados.detraf?.data_chamada || "--"} {detalheDados.detraf?.hora_atendimento || "--"}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>Assinante A</dt>
-                      <dd>{detalheDados.detraf?.assinante_a || "--"}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>Assinante B</dt>
-                      <dd>{detalheDados.detraf?.assinante_b || "--"}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>Descritor</dt>
-                      <dd>{detalheDados.detraf?.descritor_cdr || "--"}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>Duração real (s)</dt>
-                      <dd>{detalheDados.detraf?.duracao_real_segundos ?? "--"}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>Duração calculada</dt>
-                      <dd>{detalheDados.detraf?.duracao_calculada ?? "--"}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>GH</dt>
-                      <dd>{detalheDados.detraf?.gh || "--"}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>EOT (cred/deved)</dt>
-                      <dd>
-                        {detalheDados.detraf?.eqt_credora || "--"} / {detalheDados.detraf?.eqt_devedora || "--"}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt>POI</dt>
-                      <dd>{detalheDados.detraf?.poi || "--"}</dd>
-                    </div>
-                  </dl>
+        <div className="fixed inset-0 z-50 bg-black/70">
+          <div className="flex min-h-full items-start justify-center overflow-y-auto p-4 sm:p-8">
+            <div className="w-full max-w-5xl overflow-hidden rounded-2xl border border-neutral-700 bg-neutral-950 shadow-2xl">
+              <div className="flex max-h-[calc(100vh-2rem)] flex-col sm:max-h-[calc(100vh-4rem)]">
+                <div className="flex flex-col gap-3 border-b border-neutral-800 px-4 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+                  <div>
+                    <h3 className="text-lg font-semibold text-white">Detalhes da chamada</h3>
+                    {detalheDados && (
+                      <p className="text-xs text-gray-400">
+                        Resultado #{detalheDados.id} • Status: {detalheDados.status}
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    className="self-start text-sm text-gray-400 transition hover:text-white sm:self-auto"
+                    onClick={fecharDetalhes}
+                  >
+                    Fechar ✕
+                  </button>
                 </div>
 
-                <div className="space-y-3 rounded-xl border border-neutral-800 bg-neutral-900 p-4">
-                  <h4 className="text-sm font-semibold text-primary">CDR</h4>
-                  {detalheDados.cdr && Object.keys(detalheDados.cdr).length ? (
-                    <dl className="space-y-1 text-xs text-gray-300">
-                      <div className="flex justify-between">
-                        <dt>ID CDR</dt>
-                        <dd>{detalheDados.cdr.registro_id || detalheDados.cdr.id || "--"}</dd>
+                <div className="flex-1 overflow-y-auto px-4 py-4 sm:px-6">
+                  {carregandoDetalhe && (
+                    <div className="py-8 text-center text-sm text-gray-300">Carregando detalhes...</div>
+                  )}
+
+                  {!carregandoDetalhe && erroDetalhe && (
+                    <div className="py-6 text-center text-sm text-red-400">{erroDetalhe}</div>
+                  )}
+
+                  {!carregandoDetalhe && !erroDetalhe && detalheDados && (
+                    <>
+                      <div className="grid gap-6 md:grid-cols-2">
+                        <div className="space-y-3 rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+                          <h4 className="text-sm font-semibold text-primary">DETRAF</h4>
+                          <dl className="space-y-1 text-xs text-gray-300">
+                            <div className="details-pair">
+                              <dt>Sequencial</dt>
+                              <dd>{detalheDados.detraf?.sequencial || "--"}</dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>Data/Hora</dt>
+                              <dd>
+                                {detalheDados.detraf?.data_chamada || "--"} {detalheDados.detraf?.hora_atendimento || "--"}
+                              </dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>Assinante A</dt>
+                              <dd>{detalheDados.detraf?.assinante_a || "--"}</dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>Assinante B</dt>
+                              <dd>{detalheDados.detraf?.assinante_b || "--"}</dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>Descritor</dt>
+                              <dd>{detalheDados.detraf?.descritor_cdr || "--"}</dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>Duração real (s)</dt>
+                              <dd>{detalheDados.detraf?.duracao_real_segundos ?? "--"}</dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>Duração calculada</dt>
+                              <dd>{detalheDados.detraf?.duracao_calculada ?? "--"}</dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>GH</dt>
+                              <dd>{detalheDados.detraf?.gh || "--"}</dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>EQT (cred/deved)</dt>
+                              <dd>
+                                {detalheDados.detraf?.eqt_credora || "--"} / {detalheDados.detraf?.eqt_devedora || "--"}
+                              </dd>
+                            </div>
+                            <div className="details-pair">
+                              <dt>POI</dt>
+                              <dd>{detalheDados.detraf?.poi || "--"}</dd>
+                            </div>
+                          </dl>
+                        </div>
+
+                        <div className="space-y-3 rounded-xl border border-neutral-800 bg-neutral-900 p-4">
+                          <h4 className="text-sm font-semibold text-primary">CDR</h4>
+                          {detalheDados.cdr && Object.keys(detalheDados.cdr).length ? (
+                            <dl className="space-y-1 text-xs text-gray-300">
+                              <div className="details-pair">
+                                <dt>ID CDR</dt>
+                                <dd>{detalheDados.cdr.registro_id || detalheDados.cdr.id || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Data / Hora</dt>
+                                <dd>{detalheDados.cdr.calldate || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Assinante A (src)</dt>
+                                <dd>{detalheDados.cdr.src || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Assinante B (dst)</dt>
+                                <dd>{detalheDados.cdr.dst || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Canal</dt>
+                                <dd>{detalheDados.cdr.channel || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Canal destino</dt>
+                                <dd>{detalheDados.cdr.dstchannel || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Última aplicação</dt>
+                                <dd>{detalheDados.cdr.lastdata || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>EOT (A/B)</dt>
+                                <dd>
+                                  {detalheDados.cdr.eot_a || detalheDados.cdr.EOT_A || "--"} / {detalheDados.cdr.eot_b || detalheDados.cdr.EOT_B || "--"}
+                                </dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Duração total</dt>
+                                <dd>{detalheDados.cdr.duration_total ?? detalheDados.cdr.duration ?? "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Tempo tarifado (bilsec)</dt>
+                                <dd>{detalheDados.cdr.billsec ?? detalheDados.cdr.bilsec ?? "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Sigame</dt>
+                                <dd>{detalheDados.cdr.sigame || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Sentido</dt>
+                                <dd>{detalheDados.cdr.sentido || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>RURI</dt>
+                                <dd>{detalheDados.cdr.ruri || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>URI</dt>
+                                <dd>{detalheDados.cdr.uri || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Número discado</dt>
+                                <dd>{detalheDados.cdr.dialed_number || "--"}</dd>
+                              </div>
+                              <div className="details-pair">
+                                <dt>Status da chamada</dt>
+                                <dd>
+                                  {(() => {
+                                    switch ((detalheDados.cdr.disposition || "").toUpperCase()) {
+                                      case "ANSWERED":
+                                        return "Atendida";
+                                      case "BUSY":
+                                        return "Ocupado";
+                                      case "FAILED":
+                                        return "Falha";
+                                      case "NO ANSWER":
+                                        return "Sem resposta";
+                                      default:
+                                        return detalheDados.cdr.disposition || "--";
+                                    }
+                                  })()}
+                                </dd>
+                              </div>
+                            </dl>
+                          ) : (
+                            <p className="text-xs text-gray-400">Nenhum registro CDR associado.</p>
+                          )}
+                        </div>
                       </div>
-                      <div className="flex justify-between">
-                        <dt>Data / Hora</dt>
-                        <dd>{detalheDados.cdr.calldate || "--"}</dd>
+
+                      <div className="mt-6 grid gap-4 rounded-xl border border-neutral-800 bg-neutral-900 p-4 text-sm text-gray-300 md:grid-cols-2">
+                        <div>
+                          <span className="font-semibold text-gray-200">Delta duração:</span>{" "}
+                          {formatarDelta(detalheDados.delta_duracao_seg)}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-gray-200">Delta horário:</span>{" "}
+                          {formatarDelta(detalheDados.delta_hora_seg)}
+                        </div>
                       </div>
-                      <div className="flex justify-between">
-                        <dt>Assinante A (src)</dt>
-                        <dd>{detalheDados.cdr.src || "--"}</dd>
+
+                      <div className="mt-6 space-y-3 rounded-xl border border-neutral-800 bg-neutral-900/60 p-4">
+                        <div className="text-sm font-semibold text-gray-100">Motivos identificados</div>
+                        {detalheDados.detalhes_divergencia?.length ? (
+                          <ul className="space-y-2 text-sm text-gray-200">
+                            {detalheDados.detalhes_divergencia.map((motivo, indice) => (
+                              <li
+                                key={`${motivo.tipo || "info"}-${indice}`}
+                                className="rounded-lg border border-neutral-800 bg-neutral-950/80 p-3"
+                              >
+                                <div className="text-xs uppercase tracking-wide text-primary/80">
+                                  {motivo.tipo || "informativo"}
+                                </div>
+                                <p className="text-sm text-gray-200">{motivo.mensagem}</p>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-sm text-gray-400">Nenhuma divergência adicional registrada para esta chamada.</p>
+                        )}
                       </div>
-                      <div className="flex justify-between">
-                        <dt>Assinante B (dst)</dt>
-                        <dd>{detalheDados.cdr.dst || "--"}</dd>
+
+                      <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-900/40 p-4 text-sm text-gray-300">
+                        <span className="font-semibold text-gray-200">Observação principal:</span>{" "}
+                        {detalheDados.observacao || detalheDados.descricao_divergencia || "--"}
                       </div>
-                      <div className="flex justify-between">
-                        <dt>Canal</dt>
-                        <dd>{detalheDados.cdr.channel || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Canal destino</dt>
-                        <dd>{detalheDados.cdr.dstchannel || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Última aplicação</dt>
-                        <dd>{detalheDados.cdr.lastdata || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>EOT (A/B)</dt>
-                        <dd>
-                          {detalheDados.cdr.eot_a || detalheDados.cdr.EOT_A || "--"} /{" "}
-                          {detalheDados.cdr.eot_b || detalheDados.cdr.EOT_B || "--"}
-                        </dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Duração total</dt>
-                        <dd>{detalheDados.cdr.duration_total ?? detalheDados.cdr.duration ?? "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Tempo tarifado (bilsec)</dt>
-                        <dd>{detalheDados.cdr.billsec ?? detalheDados.cdr.bilsec ?? "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Sigame</dt>
-                        <dd>{detalheDados.cdr.sigame || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Sentido</dt>
-                        <dd>{detalheDados.cdr.sentido || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>RURI</dt>
-                        <dd>{detalheDados.cdr.ruri || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>URI</dt>
-                        <dd>{detalheDados.cdr.uri || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Número discado</dt>
-                        <dd>{detalheDados.cdr.dialed_number || "--"}</dd>
-                      </div>
-                      <div className="flex justify-between">
-                        <dt>Status da chamada</dt>
-                        <dd>
-                          {(() => {
-                            switch ((detalheDados.cdr.disposition || "").toUpperCase()) {
-                              case "ANSWERED":
-                                return "Atendida";
-                              case "BUSY":
-                                return "Ocupado";
-                              case "FAILED":
-                                return "Falha";
-                              case "NO ANSWER":
-                                return "Sem resposta";
-                              default:
-                                return detalheDados.cdr.disposition || "--";
-                            }
-                          })()}
-                        </dd>
-                      </div>
-                    </dl>
-                  ) : (
-                    <p className="text-xs text-gray-400">Nenhum registro CDR associado.</p>
+
+                      {mostrarDistribuicaoGh && (
+                        <div className="mt-6 space-y-3 rounded-xl border border-neutral-800 bg-neutral-900/30 p-4">
+                          <div className="text-sm font-semibold text-gray-100">Distribuição por grupo horário</div>
+                          <div className="grid gap-3 text-sm text-gray-300 md:grid-cols-3">
+                            <div>
+                              <span className="font-semibold text-gray-200">Tarifa:</span>{" "}
+                              {detalheDados.detraf?.tarifa_aplicada || "--"}
+                            </div>
+                            <div>
+                              <span className="font-semibold text-gray-200">Min. normal:</span>{" "}
+                              {formatarMinutos(detalheDados.detraf?.segundos_gh_normal)}
+                            </div>
+                            <div>
+                              <span className="font-semibold text-gray-200">Min. reduzido:</span>{" "}
+                              {formatarMinutos(detalheDados.detraf?.segundos_gh_reduzido)}
+                            </div>
+                          </div>
+                          {detalheDados.detraf?.segmentos_gh?.length ? (
+                            <div className="overflow-x-auto">
+                              <table className="min-w-full text-xs text-gray-300">
+                                <thead>
+                                  <tr className="text-left uppercase tracking-wide text-gray-400">
+                                    <th className="px-2 py-1">GH</th>
+                                    <th className="px-2 py-1">Início</th>
+                                    <th className="px-2 py-1">Fim</th>
+                                    <th className="px-2 py-1">Minutos</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {detalheDados.detraf.segmentos_gh.map((seg, idx) => (
+                                    <tr key={`${seg.inicio}-${idx}`} className="border-t border-neutral-800">
+                                      <td className="px-2 py-1">{seg.gh}</td>
+                                      <td className="px-2 py-1">{new Date(seg.inicio).toLocaleString()}</td>
+                                      <td className="px-2 py-1">{new Date(seg.fim).toLocaleString()}</td>
+                                      <td className="px-2 py-1">{formatarMinutos(seg.segundos)}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ) : (
+                            <p className="text-xs text-gray-400">Não há segmentos calculados para esta chamada.</p>
+                          )}
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
-
-              <div className="mt-6 grid gap-4 rounded-xl border border-neutral-800 bg-neutral-900 p-4 text-sm text-gray-300 md:grid-cols-2">
-                <div>
-                  <span className="font-semibold text-gray-200">Delta duração:</span>{" "}
-                  {formatarDelta(detalheDados.delta_duracao_seg)}
-                </div>
-                <div>
-                  <span className="font-semibold text-gray-200">Delta horário:</span>{" "}
-                  {formatarDelta(detalheDados.delta_hora_seg)}
-                </div>
-              </div>
-
-              <div className="mt-6 space-y-3 rounded-xl border border-neutral-800 bg-neutral-900/60 p-4">
-                <div className="text-sm font-semibold text-gray-100">Motivos identificados</div>
-                {detalheDados.detalhes_divergencia?.length ? (
-                  <ul className="space-y-2 text-sm text-gray-200">
-                    {detalheDados.detalhes_divergencia.map((motivo, indice) => (
-                      <li
-                        key={`${motivo.tipo || "info"}-${indice}`}
-                        className="rounded-lg border border-neutral-800 bg-neutral-950/80 p-3"
-                      >
-                        <div className="text-xs uppercase tracking-wide text-primary/80">
-                          {motivo.tipo || "informativo"}
-                        </div>
-                        <p className="text-sm text-gray-200">{motivo.mensagem}</p>
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-sm text-gray-400">Nenhuma divergência adicional registrada para esta chamada.</p>
-                )}
-              </div>
-
-              <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-900/40 p-4 text-sm text-gray-300">
-                <span className="font-semibold text-gray-200">Observação principal:</span>{" "}
-                {detalheDados.observacao || detalheDados.descricao_divergencia || "--"}
-              </div>
-              </>
-            )}
+            </div>
           </div>
         </div>
       )}

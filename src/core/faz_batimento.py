@@ -16,10 +16,11 @@ StatusTipo = str
 PRIORIDADE_MOTIVOS = {
     "tempo": 0,
     "status": 1,
-    "duracao": 2,
-    "eot": 3,
-    "descritor": 4,
-    "informativo": 5,
+    "gh": 2,
+    "duracao": 3,
+    "eot": 4,
+    "descritor": 5,
+    "informativo": 6,
 }
 STATUS_ATENDIDO = {"ANSWERED"}
 STATUS_DESCRICOES = {
@@ -161,6 +162,20 @@ def avaliar_divergencias(
         ok_eot, mensagem = _comparar_eot(rotulo, detraf_val, cdr_val)
         if not ok_eot and mensagem:
             motivos.append(_motivo("eot", mensagem))
+
+    gh_operadora = (detraf.get("gh") or "").strip().upper()
+    segundos_normais = int(detraf.get("segundos_gh_normal") or 0)
+    segundos_reduzidos = int(detraf.get("segundos_gh_reduzido") or 0)
+    if gh_operadora == "N" and segundos_reduzidos > 0:
+        minutos = round(segundos_reduzidos / 60, 2)
+        motivos.append(
+            _motivo("gh", f"Chamada cruza período reduzido ({minutos} min) mas GH informado = N.")
+        )
+    if gh_operadora == "R" and segundos_normais > 0:
+        minutos = round(segundos_normais / 60, 2)
+        motivos.append(
+            _motivo("gh", f"Chamada com {minutos} min em horário normal, porém GH informado = R.")
+        )
 
     motivos.sort(key=lambda item: item["prioridade"])
     if motivos:

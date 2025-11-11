@@ -14,6 +14,9 @@ body {
 .btn { @apply bg-primary hover:bg-red-700 transition-colors text-white px-4 py-2 rounded-lg; }
 .link { @apply text-gray-300 hover:text-white; }
 .btn-secondary { @apply border border-neutral-600/60 text-sm text-gray-200 px-4 py-2 rounded-lg hover:border-primary/60 hover:text-white transition-colors; }
+.details-pair { @apply flex flex-col gap-0.5 text-xs text-gray-300 sm:flex-row sm:items-start sm:justify-between; }
+.details-pair dt { @apply text-gray-400; }
+.details-pair dd { @apply text-gray-100 break-words text-left sm:text-right; }
 
 @keyframes progress-slide {
   0% { transform: translateX(-100%); }

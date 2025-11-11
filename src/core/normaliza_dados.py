@@ -4,16 +4,36 @@ import json
 import re
 import time as systime
 from datetime import datetime, date, time as dt_time, timedelta
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import mysql.connector as mysql
 
 from .banco.conexao_banco import obter_conexao
 from .banco.clientes_schema import conexao_banco_cliente, obter_banco_cliente
+from .gh import calcular_segmentos_gh
 
 TELEFONE_RGX = re.compile(r"\D")
 DDD_VALIDO = {f"{i:02d}" for i in range(11, 100)}
 TOLL_PREFIXOS = ("0800", "0300", "0500", "0900")
+
+
+def _eh_destino_cng(destino_raw: Optional[str], destino_norm: Optional[str]) -> bool:
+    """Retorna True quando o destino representa um CNG (0800/0300/0500/0900 ou literal CNG)."""
+    if not destino_raw and not destino_norm:
+        return False
+    destino_raw_fmt = (destino_raw or "").strip().upper()
+    if destino_raw_fmt == "CNG":
+        return True
+
+    digitos_raw = TELEFONE_RGX.sub("", destino_raw or "")
+    if digitos_raw and any(digitos_raw.startswith(prefix) for prefix in TOLL_PREFIXOS):
+        return True
+
+    digitos_norm = TELEFONE_RGX.sub("", destino_norm or "")
+    if digitos_norm and any(digitos_norm.startswith(prefix.lstrip("0")) for prefix in TOLL_PREFIXOS):
+        return True
+
+    return False
 
 
 def _extrair_ddd(numero: Optional[str]) -> Optional[str]:
@@ -77,6 +97,38 @@ def _normalizar_telefone(valor: Optional[str], ddd_base: Optional[str] = None) -
     return digitos
 
 
+def _tipo_numero(valor: Optional[str]) -> Optional[str]:
+    if not valor:
+        return None
+    digitos = TELEFONE_RGX.sub("", str(valor))
+    if len(digitos) < 10:
+        return None
+    codigo_inicial = digitos[2]
+    if len(digitos) == 11 and codigo_inicial == "9":
+        return "MOVEL"
+    if codigo_inicial in {"2", "3", "4", "5"}:
+        return "FIXO"
+    return None
+
+
+def _definir_tarifa(destino_raw: Optional[str], destino_norm: Optional[str], origem_norm: Optional[str]) -> Optional[str]:
+    destino_tipo = _tipo_numero(destino_norm or destino_raw)
+    origem_tipo = _tipo_numero(origem_norm)
+
+    if _eh_destino_cng(destino_raw, destino_norm):
+        if origem_tipo == "MOVEL":
+            return "VU-M"
+        if origem_tipo == "FIXO":
+            return "TU-RL"
+        return None
+
+    if destino_tipo == "MOVEL":
+        return "VU-M"
+    if destino_tipo == "FIXO":
+        return "TU-RL"
+    return None
+
+
 def _normalizar_hora(hora_ref: Optional[object]) -> Optional[dt_time]:
     if hora_ref is None:
         return None
@@ -118,6 +170,181 @@ def _duracao_calculada_para_segundos(valor) -> int:
         return 0
 
 
+def _carregar_detraf_normalizado_existente(id_cliente: int, id_importacao: int) -> List[Dict]:
+    conexao = obter_conexao()
+    cursor = conexao.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT id_registro, sequencial, data_hora, duracao_segundos, duracao_calculada_seg,
+                   assinante_a_norm, assinante_b_norm, descritor, gh, eot_credora, eot_devedora,
+                   poi, tarifa_aplicada, segundos_gh_normal, segundos_gh_reduzido, detalhes_gh,
+                   chave_batimento, snapshot
+            FROM detraf_normalizado
+            WHERE id_cliente=%s AND id_importacao=%s
+            """,
+            (id_cliente, id_importacao),
+        )
+        linhas = cursor.fetchall()
+    finally:
+        cursor.close()
+        conexao.close()
+
+    if not linhas:
+        return []
+
+    resultado: List[Dict] = []
+    for linha in linhas:
+        segmentos = linha.get("detalhes_gh")
+        if isinstance(segmentos, str):
+            try:
+                segmentos = json.loads(segmentos)
+            except json.JSONDecodeError:
+                segmentos = []
+        resultado.append(
+            {
+                "id_registro": linha["id_registro"],
+                "sequencial": linha.get("sequencial"),
+                "data_hora": linha.get("data_hora"),
+                "duracao_segundos": int(linha.get("duracao_segundos") or 0),
+                "duracao_calculada": int(linha.get("duracao_calculada_seg") or 0),
+                "assinante_a": linha.get("assinante_a_norm"),
+                "assinante_b": linha.get("assinante_b_norm"),
+                "descritor": linha.get("descritor"),
+                "gh": linha.get("gh"),
+                "eqt_credora": linha.get("eot_credora"),
+                "eqt_devedora": linha.get("eot_devedora"),
+                "poi": linha.get("poi"),
+                "tarifa_aplicada": linha.get("tarifa_aplicada"),
+                "segundos_gh_normal": int(linha.get("segundos_gh_normal") or 0),
+                "segundos_gh_reduzido": int(linha.get("segundos_gh_reduzido") or 0),
+                "segmentos_gh": segmentos or [],
+                "snapshot": linha.get("snapshot"),
+                "chave": linha.get("chave_batimento"),
+            }
+        )
+    return resultado
+
+
+def _carregar_cdr_normalizado_existente(id_cliente: int, id_importacao: int) -> List[Dict]:
+    conexao = obter_conexao()
+    cursor = conexao.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT id_registro, data_hora, duracao_segundos, caller_norm, callee_norm, descritor,
+                   gh, eot, chave_batimento, snapshot
+            FROM cdr_normalizado
+            WHERE id_cliente=%s AND id_importacao=%s
+            """,
+            (id_cliente, id_importacao),
+        )
+        linhas = cursor.fetchall()
+    finally:
+        cursor.close()
+        conexao.close()
+
+    if not linhas:
+        return []
+
+    resultado: List[Dict] = []
+    for linha in linhas:
+        snapshot_raw = linha.get("snapshot")
+        snapshot = {}
+        if snapshot_raw:
+            try:
+                snapshot = json.loads(snapshot_raw)
+            except json.JSONDecodeError:
+                snapshot = {}
+        disposition = snapshot.get("disposition")
+        if disposition is not None:
+            disposition = str(disposition).strip().upper() or None
+        sentido = snapshot.get("sentido")
+        if sentido is not None:
+            sentido = str(sentido).strip().upper() or None
+        eot_a = snapshot.get("eot_a")
+        if eot_a is not None:
+            eot_a = str(eot_a).strip() or None
+        eot_b = snapshot.get("eot_b")
+        if eot_b is not None:
+            eot_b = str(eot_b).strip() or None
+
+        resultado.append(
+            {
+                "id_registro": linha["id_registro"],
+                "data_hora": linha.get("data_hora"),
+                "duracao_segundos": int(linha.get("duracao_segundos") or 0),
+                "caller_norm": linha.get("caller_norm"),
+                "callee_norm": linha.get("callee_norm"),
+                "descritor": linha.get("descritor"),
+                "disposition": disposition,
+                "sentido": sentido,
+                "eot_a": eot_a,
+                "eot_b": eot_b,
+                "eot": linha.get("eot"),
+                "snapshot": snapshot_raw,
+                "chave": linha.get("chave_batimento"),
+            }
+        )
+    return resultado
+
+
+def _chave_unificacao_gh(registro: Dict) -> Tuple:
+    return (
+        (registro.get("assinante_a") or "").strip(),
+        (registro.get("assinante_b") or "").strip(),
+        registro.get("data_chamada"),
+        registro.get("hora_atendimento"),
+        registro.get("eqt_credora"),
+        registro.get("eqt_devedora"),
+    )
+
+
+def _mesclar_registros_por_gh(registros: Sequence[Dict]) -> Dict:
+    base = dict(registros[0])
+    partes = []
+    total_real = 0
+    total_calc_seg = 0
+
+    for item in registros:
+        dur_real = int(item.get("duracao_real_segundos") or 0)
+        dur_calc_seg = _duracao_calculada_para_segundos(item.get("duracao_calculada"))
+        partes.append(
+            {
+                "id": item.get("id"),
+                "sequencial": item.get("sequencial"),
+                "gh": (item.get("gh") or "").strip() or None,
+                "duracao_real_segundos": dur_real,
+                "duracao_calculada_seg": dur_calc_seg,
+            }
+        )
+        total_real += dur_real
+        total_calc_seg += dur_calc_seg
+
+    base["duracao_real_segundos"] = total_real
+    if total_calc_seg:
+        base["duracao_calculada"] = total_calc_seg / 60
+    base["__gh_unificado"] = True
+    base["__gh_partes"] = partes
+    return base
+
+
+def _unificar_registros_por_gh(registros: Sequence[Dict]) -> List[Dict]:
+    agrupados: Dict[Tuple, List[Dict]] = {}
+    for registro in registros:
+        chave = _chave_unificacao_gh(registro)
+        agrupados.setdefault(chave, []).append(registro)
+
+    resultado: List[Dict] = []
+    for itens in agrupados.values():
+        ghs = {(item.get("gh") or "").strip().upper() for item in itens if item.get("gh")}
+        if len(itens) > 1 and len(ghs) > 1:
+            resultado.append(_mesclar_registros_por_gh(itens))
+        else:
+            resultado.extend(itens)
+    return resultado
+
+
 def _hora_para_segundos(data_hora: Optional[datetime]) -> Optional[int]:
     if not data_hora:
         return None
@@ -136,6 +363,13 @@ def _json_dump(payload: Dict) -> str:
 
 
 def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: Optional[Callable[[int, int], None]] = None) -> List[Dict]:
+    existentes = _carregar_detraf_normalizado_existente(id_cliente, id_importacao)
+    if existentes:
+        if notificar_progresso:
+            total_existentes = len(existentes)
+            notificar_progresso(total_existentes, total_existentes)
+        return existentes
+
     conexao = obter_conexao()
     cursor = conexao.cursor(dictionary=True)
     try:
@@ -155,7 +389,8 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
             """,
             (id_importacao,),
         )
-        registros = cursor.fetchall()
+        registros_brutos = cursor.fetchall()
+        registros = _unificar_registros_por_gh(registros_brutos)
         total = len(registros)
 
         sql_insert = (
@@ -164,9 +399,10 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                 id_cliente, id_importacao, id_registro, sequencial, data_hora, data_referencia,
                 hora_segundos, duracao_segundos, duracao_calculada_seg, assinante_a_norm,
                 assinante_b_norm, descritor, gh, eot_credora, eot_devedora, poi,
+                tarifa_aplicada, segundos_gh_normal, segundos_gh_reduzido, detalhes_gh,
                 chave_batimento, snapshot
             ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             )
             """
         )
@@ -183,7 +419,24 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
             ddd_a = _extrair_ddd(assinante_a)
             assinante_b = _normalizar_telefone(registro.get("assinante_b"), ddd_base=ddd_a)
             chave = _gerar_chave(assinante_a, assinante_b, data_hora)
-            snapshot = _json_dump(registro)
+            tarifa_aplicada = _definir_tarifa(registro.get("assinante_b"), assinante_b, assinante_a)
+            tarifa_base = tarifa_aplicada or "TU-RL"
+            gh_resultado = calcular_segmentos_gh(data_hora, duracao_segundos, tarifa_base)
+            segmentos_gh = [segmento.__dict__ for segmento in gh_resultado.segmentos]
+
+            registro_snapshot = dict(registro)
+            registro_snapshot.update(
+                {
+                    "tarifa_aplicada": tarifa_aplicada,
+                    "segundos_gh_normal": gh_resultado.segundos_normal,
+                    "segundos_gh_reduzido": gh_resultado.segundos_reduzido,
+                    "segmentos_gh": segmentos_gh,
+                }
+            )
+            if registro.get("__gh_unificado"):
+                registro_snapshot["gh_unificado"] = True
+                registro_snapshot["partes_gh_origem"] = registro.get("__gh_partes", [])
+            snapshot = _json_dump(registro_snapshot)
 
             normalizado = {
                 "id_registro": registro["id"],
@@ -198,6 +451,10 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                 "eqt_credora": registro.get("eqt_credora"),
                 "eqt_devedora": registro.get("eqt_devedora"),
                 "poi": registro.get("poi"),
+                "tarifa_aplicada": tarifa_aplicada,
+                "segundos_gh_normal": gh_resultado.segundos_normal,
+                "segundos_gh_reduzido": gh_resultado.segundos_reduzido,
+                "segmentos_gh": segmentos_gh,
                 "snapshot": snapshot,
                 "chave": chave,
             }
@@ -221,6 +478,10 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                     registro.get("eqt_credora"),
                     registro.get("eqt_devedora"),
                     registro.get("poi"),
+                    tarifa_aplicada,
+                    gh_resultado.segundos_normal,
+                    gh_resultado.segundos_reduzido,
+                    json.dumps(segmentos_gh, ensure_ascii=False),
                     chave,
                     snapshot,
                 )
@@ -292,6 +553,16 @@ def normalizar_cdr(
     periodo_fim: Optional[date] = None,
     notificar_progresso: Optional[Callable[[int, int], None]] = None,
 ) -> List[Dict]:
+    if not id_importacao_cdr:
+        return []
+
+    existentes = _carregar_cdr_normalizado_existente(id_cliente, id_importacao_cdr)
+    if existentes:
+        if notificar_progresso:
+            total_existentes = len(existentes)
+            notificar_progresso(total_existentes, total_existentes)
+        return existentes
+
     nome_banco = obter_banco_cliente(id_cliente)
     if not nome_banco:
         raise RuntimeError(f"Cliente {id_cliente} sem banco configurado para CDR.")

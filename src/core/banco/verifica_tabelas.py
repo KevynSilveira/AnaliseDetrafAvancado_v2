@@ -224,6 +224,10 @@ def criar_tabela_detraf_normalizado():
             eot_credora CHAR(3) NULL,
             eot_devedora CHAR(3) NULL,
             poi VARCHAR(15) NULL,
+            tarifa_aplicada VARCHAR(10) NULL,
+            segundos_gh_normal INT DEFAULT 0,
+            segundos_gh_reduzido INT DEFAULT 0,
+            detalhes_gh LONGTEXT NULL,
             chave_batimento VARCHAR(255) NULL,
             snapshot LONGTEXT NULL,
             criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -234,6 +238,25 @@ def criar_tabela_detraf_normalizado():
         )
         """
     )
+    def _garantir_coluna(nome: str, ddl: str):
+        cursor.execute(
+            """
+            SELECT COUNT(1)
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'detraf_normalizado'
+              AND COLUMN_NAME = %s
+            """,
+            (nome,),
+        )
+        existe = cursor.fetchone()
+        if not existe or not existe[0]:
+            cursor.execute(ddl)
+
+    _garantir_coluna("tarifa_aplicada", "ALTER TABLE detraf_normalizado ADD COLUMN tarifa_aplicada VARCHAR(10) NULL AFTER poi")
+    _garantir_coluna("segundos_gh_normal", "ALTER TABLE detraf_normalizado ADD COLUMN segundos_gh_normal INT DEFAULT 0 AFTER tarifa_aplicada")
+    _garantir_coluna("segundos_gh_reduzido", "ALTER TABLE detraf_normalizado ADD COLUMN segundos_gh_reduzido INT DEFAULT 0 AFTER segundos_gh_normal")
+    _garantir_coluna("detalhes_gh", "ALTER TABLE detraf_normalizado ADD COLUMN detalhes_gh LONGTEXT NULL AFTER segundos_gh_reduzido")
     conexao.commit()
     cursor.close()
     conexao.close()
