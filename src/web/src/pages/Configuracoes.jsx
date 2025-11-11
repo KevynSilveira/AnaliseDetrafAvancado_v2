@@ -203,7 +203,7 @@ export default function Configuracoes() {
     try {
       setProcessando(true);
       setMensagem("");
-      const resposta = await api.post("/api/limpeza/manual", payload);
+      const resposta = await api.post("/api/limpeza/manual", payload, { timeout: 180000 });
       setMensagem(resposta?.mensagem || "Limpeza concluída.");
       setResultadoResumo(resposta?.resultados || []);
       setSelecionarImportacoes([]);

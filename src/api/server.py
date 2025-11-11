@@ -12,15 +12,14 @@ import io
 import json
 import os
 import re
-import subprocess
 import threading
 from functools import lru_cache
 from pathlib import Path
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal
 from typing import Dict, Iterable, List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from dotenv import load_dotenv
@@ -37,6 +36,10 @@ from src.core.banco.verifica_tabelas import (
     criar_tabela_detraf_operadora_batimento,
     criar_tabela_arquivos_importacao,
     criar_tabela_cdr_tabelas_importadas,
+    criar_tabela_conferencia_execucoes,
+    criar_tabela_detraf_normalizado,
+    criar_tabela_cdr_normalizado,
+    criar_tabela_conferencia_resultados,
 )
 from src.core.limpeza import (
     limpar_logs,
@@ -47,6 +50,9 @@ from src.core.limpeza import (
     registrar_execucao,
     buscar_importacoes,
 )
+from src.core.faz_batimento import executar_batimento
+from src.core.importadores.importador_cdr import importar_dump_cdr
+from src.core.importadores.importador_detraf import processar_arquivo_detraf
 
 # ======================================
 # Carrega o .env do caminho correto
@@ -113,6 +119,10 @@ def ensure_tables():
     criar_tabela_detraf_operadora_batimento()
     criar_tabela_arquivos_importacao()
     criar_tabela_cdr_tabelas_importadas()
+    criar_tabela_conferencia_execucoes()
+    criar_tabela_detraf_normalizado()
+    criar_tabela_cdr_normalizado()
+    criar_tabela_conferencia_resultados()
     _coluna_existe.cache_clear()
 
 ensure_tables()
@@ -157,6 +167,11 @@ class LimpezaManualEntrada(BaseModel):
     periodo_inicio: Optional[str] = None
     periodo_fim: Optional[str] = None
     ids_importacoes: List[int] = Field(default_factory=list)
+
+
+class ConferenciaProcessarEntrada(BaseModel):
+    id_importacao_detraf: int
+    id_importacao_cdr: Optional[int] = None
 
 
 def atualizar_controle_importacao(id_importacao: int, **campos):
@@ -214,6 +229,282 @@ def registrar_tabelas_cdr(id_importacao: int, tabelas: List[str]) -> None:
         conexao.close()
 
 
+def registrar_execucao_conferencia(id_cliente: int, id_importacao_detraf: int, id_importacao_cdr: Optional[int]) -> int:
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(
+            """
+            INSERT INTO conferencia_execucoes (id_cliente, id_importacao_detraf, id_importacao_cdr)
+            VALUES (%s, %s, %s)
+            """,
+            (id_cliente, id_importacao_detraf, id_importacao_cdr),
+        )
+        conexao.commit()
+        return cursor.lastrowid
+    finally:
+        conexao.close()
+
+
+def atualizar_execucao_conferencia(exec_id: int, **campos) -> None:
+    if not campos:
+        return
+    colunas = ", ".join(f"{campo}=%s" for campo in campos.keys())
+    parametros = list(campos.values()) + [exec_id]
+
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(
+            f"UPDATE conferencia_execucoes SET {colunas} WHERE id=%s",
+            parametros,
+        )
+        conexao.commit()
+    finally:
+        conexao.close()
+
+
+def obter_execucao_conferencia(exec_id: int) -> Optional[dict]:
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM conferencia_execucoes WHERE id=%s",
+            (exec_id,),
+        )
+        return cursor.fetchone()
+    finally:
+        conexao.close()
+
+
+def _callback_execucao(exec_id: Optional[int]):
+    if not exec_id:
+        return None
+
+    def atualizar(status: str, etapa: str, progresso: int, processados: int, total: int, mensagem: Optional[str] = None):
+        campos = {
+            "status_execucao": status,
+            "etapa_atual": etapa,
+            "progresso_percentual": min(max(progresso, 0), 99),
+            "processados": processados,
+            "total_registros": total,
+        }
+        if mensagem:
+            campos["mensagem"] = mensagem
+        atualizar_execucao_conferencia(exec_id, **campos)
+
+    return atualizar
+
+
+def _obter_importacao(id_importacao: int) -> Optional[dict]:
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT ci.*, cli.nome_cliente
+            FROM controle_importacoes ci
+            LEFT JOIN clientes cli ON cli.id_cliente = ci.id_cliente
+            WHERE ci.id = %s
+            LIMIT 1
+            """,
+            (id_importacao,),
+        )
+        return cursor.fetchone()
+    finally:
+        conexao.close()
+
+
+def _buscar_importacao_recente(id_cliente: int, tipo: str) -> Optional[dict]:
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id, nome_arquivo, periodo_inicial, periodo_final
+            FROM controle_importacoes
+            WHERE id_cliente = %s AND tipo_arquivo = %s AND status = 'CONCLUIDO'
+            ORDER BY data_importacao DESC, id DESC
+            LIMIT 1
+            """,
+            (id_cliente, tipo),
+        )
+        return cursor.fetchone()
+    finally:
+        conexao.close()
+
+
+def _executar_conferencia_automatica(
+    id_cliente: int,
+    id_importacao_detraf: int,
+    periodo_detraf_inicio: Optional[date],
+    periodo_detraf_fim: Optional[date],
+    id_importacao_cdr: Optional[int] = None,
+    periodo_cdr_inicio: Optional[date] = None,
+    periodo_cdr_fim: Optional[date] = None,
+) -> Optional[dict]:
+    cdr_info = None
+    if id_importacao_cdr:
+        cdr_info = {
+            "id": id_importacao_cdr,
+            "periodo_inicial": periodo_cdr_inicio,
+            "periodo_final": periodo_cdr_fim,
+        }
+    else:
+        cdr_info = _buscar_importacao_recente(id_cliente, "CDR")
+
+    if not cdr_info or not cdr_info.get("id"):
+        return None
+
+    periodo_inicio = periodo_detraf_inicio or cdr_info.get("periodo_inicial")
+    periodo_fim = periodo_detraf_fim or cdr_info.get("periodo_final")
+
+    exec_id = registrar_execucao_conferencia(id_cliente, id_importacao_detraf, cdr_info["id"])
+    resumo = executar_batimento(
+        id_cliente=id_cliente,
+        id_importacao_detraf=id_importacao_detraf,
+        id_importacao_cdr=cdr_info["id"],
+        periodo_inicio=periodo_inicio,
+        periodo_fim=periodo_fim,
+        notificar_execucao=_callback_execucao(exec_id),
+    )
+    return {
+        "resumo": resumo,
+        "id_importacao_cdr": cdr_info["id"],
+        "id_execucao": exec_id,
+    }
+
+
+STATUS_VALIDOS = {"CONFERIDO", "DIVERGENTE", "PERDIDO"}
+
+
+def _filtrar_status_param(valores: Optional[List[str]]) -> List[str]:
+    if not valores:
+        return []
+    resultado: List[str] = []
+    for valor in valores:
+        chave = (valor or "").strip().upper()
+        if chave in STATUS_VALIDOS and chave not in resultado:
+            resultado.append(chave)
+    return resultado
+
+
+def _formatar_segundos(valor: Optional[int]) -> str:
+    if valor is None:
+        return "--"
+    total = max(0, int(valor))
+    horas, resto = divmod(total, 3600)
+    minutos, segundos = divmod(resto, 60)
+    return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+
+
+def _formatar_data_display(dt: Optional[datetime]) -> tuple[str, str]:
+    if not dt:
+        return "--", "--"
+    return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S")
+
+
+def _formatar_janela(inicio: Optional[date], fim: Optional[date]) -> str:
+    if not inicio and not fim:
+        return "--"
+    if inicio and fim:
+        return f"{inicio:%Y%m} – {fim:%Y%m}"
+    ref = inicio or fim
+    return ref.strftime("%Y%m") if ref else "--"
+
+
+def _montar_filtros_conferencia(
+    id_importacao: int,
+    status: Optional[List[str]],
+    busca: Optional[str],
+    descritor: Optional[str],
+    gh: Optional[str],
+    apenas_sem_cdr: bool,
+    diferenca_min: Optional[int],
+):
+    condicoes = ["id_importacao_detraf = %s"]
+    parametros: List = [id_importacao]
+
+    status_filtrados = _filtrar_status_param(status)
+    if status_filtrados:
+        condicoes.append("status IN (" + ",".join(["%s"] * len(status_filtrados)) + ")")
+        parametros.extend(status_filtrados)
+
+    if busca:
+        termo = busca.strip()
+        termo_digits = re.sub(r"\D", "", termo)
+        alvo = termo_digits or termo
+        if alvo:
+            condicoes.append("(assinante_a LIKE %s OR assinante_b LIKE %s)")
+            like = f"%{alvo}%"
+            parametros.extend([like, like])
+
+    if descritor:
+        condicoes.append("descritor = %s")
+        parametros.append(descritor.strip().upper())
+
+    if gh:
+        condicoes.append("gh = %s")
+        parametros.append(gh.strip().upper())
+
+    if apenas_sem_cdr:
+        condicoes.append("id_registro_cdr IS NULL")
+
+    if diferenca_min is not None:
+        condicoes.append("delta_duracao_seg >= %s")
+        parametros.append(int(diferenca_min))
+
+    where = " AND ".join(condicoes)
+    return where, parametros
+
+
+def _consultar_conferencia_resultados(
+    where: str,
+    parametros: List,
+    limite: Optional[int],
+    offset: int = 0,
+):
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            f"SELECT COUNT(1) AS total FROM conferencia_resultados WHERE {where}",
+            tuple(parametros),
+        )
+        total = int(cursor.fetchone()["total"] or 0)
+
+        consulta_sql = (
+            f"""
+            SELECT id, status, observacao, descricao_divergencia, assinante_a, assinante_b, descritor, gh,
+                   data_hora, duracao_detraf_seg, duracao_cdr_seg, eot_detraf, eot_cdr,
+                   delta_duracao_seg, delta_hora_seg, id_registro_detraf, id_registro_cdr
+            FROM conferencia_resultados
+            WHERE {where}
+            ORDER BY FIELD(status,'CONFERIDO','DIVERGENTE','PERDIDO'), data_hora ASC, id ASC
+            """
+        )
+        consulta_parametros = list(parametros)
+        if limite is not None:
+            consulta_sql += " LIMIT %s OFFSET %s"
+            consulta_parametros.extend([limite, offset])
+        cursor.execute(consulta_sql, tuple(consulta_parametros))
+        registros = cursor.fetchall()
+        return total, registros
+    finally:
+        conexao.close()
+
+
+def _carregar_snapshot(payload):
+    if not payload:
+        return {}
+    if isinstance(payload, (dict, list)):
+        return payload
+    try:
+        return json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        return {"raw": payload}
+
+
 def marcar_arquivo_removido(caminho: Path) -> None:
     conexao = db()
     try:
@@ -262,318 +553,6 @@ def _listar_logs() -> List[dict]:
     return [item for _, item in itens]
 
 
-def importar_dump_cdr(caminho_dump: Path, id_cliente: int):
-    """Executa o dump CDR diretamente no banco dedicado do cliente."""
-    if not DBCFG.get("database"):
-        raise RuntimeError("Banco de dados não configurado para importação CDR.")
-
-    nome_banco_cliente = garantir_banco_cliente(id_cliente)
-
-    comando = ["mysql"]
-    if DBCFG.get("host"):
-        comando.extend(["-h", DBCFG["host"]])
-    if DBCFG.get("port"):
-        comando.extend(["-P", str(DBCFG["port"])])
-    if DBCFG.get("user"):
-        comando.extend(["-u", DBCFG["user"]])
-
-    ambiente = os.environ.copy()
-    if DBCFG.get("password"):
-        ambiente["MYSQL_PWD"] = DBCFG["password"]
-
-    # Remove tabela CDR anterior, se existir
-    conexao_cli = conexao_banco_cliente(id_cliente)
-    try:
-        cursor_cli = conexao_cli.cursor()
-        cursor_cli.execute("DROP TABLE IF EXISTS cdr")
-        conexao_cli.commit()
-    finally:
-        conexao_cli.close()
-
-    comando.extend(["-D", nome_banco_cliente])
-
-    with open(caminho_dump, "rb") as conteudo_dump:
-        subprocess.run(
-            comando,
-            stdin=conteudo_dump,
-            check=True,
-            env=ambiente,
-        )
-
-    periodo_inicial = None
-    periodo_final = None
-
-    conexao_cli = conexao_banco_cliente(id_cliente)
-    try:
-        cursor_cli = conexao_cli.cursor()
-        try:
-            cursor_cli.execute("SELECT MIN(calldate), MAX(calldate) FROM cdr")
-            resultado = cursor_cli.fetchone()
-            if resultado:
-                periodo_inicial, periodo_final = resultado
-        except mysql.Error:
-            periodo_inicial = None
-            periodo_final = None
-    finally:
-        conexao_cli.close()
-
-    tabela_utilizada = f"{nome_banco_cliente}.cdr"
-    tabelas_finais = [tabela_utilizada]
-
-    return periodo_inicial, periodo_final, tabela_utilizada, tabelas_finais
-
-
-INSERT_DETRAF_SQL = """
-    INSERT INTO detraf_operadora_batimento (
-        id_importacao, sequencial, assinante_a, eqt_a, cnl_a, area_local_a, data_chamada,
-        hora_atendimento, assinante_b, eqt_b, cnl_b, area_local_b, duracao_real_segundos,
-        poi, descritor_cdr, duracao_calculada, categoria_assinante_a, fds,
-        causa_saida, contador_saidas_parciais, valor_remuneracao, gh, eqt_credora, eqt_devedora
-    ) VALUES (
-        %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s
-    )
-"""
-
-
-def _hhmmss_para_segundos(valor: str) -> int:
-    try:
-        h = int(valor[0:2])
-        m = int(valor[2:4])
-        s = int(valor[4:6])
-        return h * 3600 + m * 60 + s
-    except (TypeError, ValueError, IndexError):
-        return 0
-
-
-def _minutos_decimal(valor: str) -> Decimal:
-    try:
-        bruto = valor.strip().lstrip("0")
-        if not bruto:
-            return Decimal("0.0")
-        calculado = Decimal(bruto) / Decimal("10")
-        return calculado.quantize(Decimal("0.1"), rounding=ROUND_DOWN)
-    except (ArithmeticError, ValueError, AttributeError):
-        return Decimal("0.0")
-
-
-def _valor_remuneracao(valor: str) -> Decimal:
-    try:
-        bruto = valor.strip().lstrip("0")
-        if not bruto:
-            return Decimal("0.00000")
-        calculado = Decimal(bruto) / Decimal("100000")
-        return calculado.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-    except (ArithmeticError, ValueError, AttributeError):
-        return Decimal("0.00000")
-
-
-def _parse_data(valor: str):
-    try:
-        return datetime.strptime(valor, "%Y%m%d").date()
-    except (ValueError, TypeError):
-        return None
-
-
-def _parse_hora(valor: str):
-    try:
-        return datetime.strptime(valor, "%H%M%S").time()
-    except (ValueError, TypeError):
-        return None
-
-
-def processar_arquivo_detraf(caminho: Path, id_importacao: int, id_cliente: int):
-    """Processa o arquivo DETRAF, populando a tabela de batimento e atualizando metadados."""
-    atualizar_controle_importacao(
-        id_importacao,
-        mensagem="Processando arquivo DETRAF. Extraindo dados de batimento...",
-        status="PROCESSANDO",
-    )
-
-    if not caminho.exists():
-        raise HTTPException(status_code=404, detail="Arquivo de importação não encontrado.")
-
-    conexao = db()
-    cursor = conexao.cursor()
-
-    garantir_banco_cliente(id_cliente)
-    conexao_cli = conexao_banco_cliente(id_cliente)
-    cursor_cli = conexao_cli.cursor()
-    try:
-        cursor_cli.execute("DELETE FROM detraf_operadora_batimento WHERE id_importacao=%s", (id_importacao,))
-        conexao_cli.commit()
-    except mysql.Error:
-        conexao_cli.rollback()
-
-    try:
-        # Evita duplicidades caso reprocessado
-        cursor.execute("DELETE FROM detraf_operadora_batimento WHERE id_importacao=%s", (id_importacao,))
-        conexao.commit()
-
-        total = 0
-        datas: List[date] = []
-        eqt_credoras: set[str] = set()
-        eqt_devedoras: set[str] = set()
-
-        lote: list[tuple] = []
-        lote_cli: list[tuple] = []
-        tamanho_lote = 1000
-
-        tamanho_arquivo = max(caminho.stat().st_size, 1)
-        bytes_processados = 0
-        proximo_marco = 5
-
-        with open(caminho, "r", encoding="utf-8", errors="ignore") as handle:
-            for linha in handle:
-                if len(linha) < 153:
-                    continue
-
-                sequencial = linha[0:10].strip()
-                assinante_a = re.sub(r"\D", "", linha[10:31])
-                eqt_a = linha[31:34].strip()
-                cnl_a = linha[34:39].strip()
-                area_local_a = linha[39:43].strip()
-
-                data_ref = _parse_data(linha[43:51].strip())
-                hora_ref = _parse_hora(linha[51:57].strip())
-
-                assinante_b = re.sub(r"\D", "", linha[57:77])
-                eqt_b = linha[77:80].strip()
-                cnl_b = linha[80:85].strip()
-                area_local_b = linha[85:89].strip()
-                duracao_real_segundos = _hhmmss_para_segundos(linha[89:96])
-                poi = linha[96:106].strip()
-                descritor_cdr = re.sub(r"[^A-Z]", "", linha[106:111].upper())
-                duracao_calculada = _minutos_decimal(linha[111:124])
-                categoria_assinante_a = linha[124:126].strip()
-                fds = linha[126:128].strip()
-                causa_saida = linha[128:129].strip()
-                contador_saidas_parciais = linha[129:131].strip()
-                valor_remuneracao = _valor_remuneracao(linha[131:146])
-                gh = linha[146:147].strip()
-                eqt_credora = linha[147:150].strip()
-                eqt_devedora = linha[150:153].strip()
-
-                if data_ref:
-                    datas.append(data_ref)
-                if eqt_credora:
-                    eqt_credoras.add(eqt_credora)
-                if eqt_devedora:
-                    eqt_devedoras.add(eqt_devedora)
-
-                lote.append(
-                    (
-                        id_importacao,
-                        sequencial or None,
-                        assinante_a or None,
-                        eqt_a or None,
-                        cnl_a or None,
-                        area_local_a or None,
-                        data_ref,
-                        hora_ref,
-                        assinante_b or None,
-                        eqt_b or None,
-                        cnl_b or None,
-                        area_local_b or None,
-                        duracao_real_segundos,
-                        poi or None,
-                        descritor_cdr or None,
-                        duracao_calculada,
-                        categoria_assinante_a or None,
-                        fds or None,
-                        causa_saida or None,
-                        contador_saidas_parciais or None,
-                        valor_remuneracao,
-                        gh or None,
-                        eqt_credora or None,
-                        eqt_devedora or None,
-                    )
-                )
-                lote_cli.append(
-                    (
-                        id_importacao,
-                        sequencial or None,
-                        assinante_a or None,
-                        eqt_a or None,
-                        cnl_a or None,
-                        area_local_a or None,
-                        data_ref,
-                        hora_ref,
-                        assinante_b or None,
-                        eqt_b or None,
-                        cnl_b or None,
-                        area_local_b or None,
-                        duracao_real_segundos,
-                        poi or None,
-                        descritor_cdr or None,
-                        duracao_calculada,
-                        categoria_assinante_a or None,
-                        fds or None,
-                        causa_saida or None,
-                        contador_saidas_parciais or None,
-                        valor_remuneracao,
-                        gh or None,
-                        eqt_credora or None,
-                        eqt_devedora or None,
-                    )
-                )
-
-                total += 1
-                if len(lote) >= tamanho_lote:
-                    cursor.executemany(INSERT_DETRAF_SQL, lote)
-                    conexao.commit()
-                    lote.clear()
-
-                if len(lote_cli) >= tamanho_lote:
-                    cursor_cli.executemany(INSERT_DETRAF_SQL, lote_cli)
-                    conexao_cli.commit()
-                    lote_cli.clear()
-
-                bytes_processados += len(linha.encode("utf-8", errors="ignore"))
-                if tamanho_arquivo and proximo_marco <= 100:
-                    progresso = int(bytes_processados / tamanho_arquivo * 100)
-                    if progresso >= proximo_marco:
-                        atualizar_controle_importacao(
-                            id_importacao,
-                            mensagem=f"Processando arquivo DETRAF ({min(progresso, 99)}% concluído)...",
-                        )
-                        while proximo_marco <= progresso:
-                            proximo_marco += 5
-
-        if lote:
-            cursor.executemany(INSERT_DETRAF_SQL, lote)
-            conexao.commit()
-
-        if lote_cli:
-            cursor_cli.executemany(INSERT_DETRAF_SQL, lote_cli)
-            conexao_cli.commit()
-
-        periodo_inicial = min(datas) if datas else None
-        periodo_final = max(datas) if datas else None
-        eqt_credora_val = ", ".join(sorted(eqt_credoras)) or None
-        eqt_devedora_val = ", ".join(sorted(eqt_devedoras)) or None
-
-        atualizar_controle_importacao(
-            id_importacao,
-            status="CONCLUIDO",
-            mensagem=f"Arquivo DETRAF importado com sucesso. {total} registros processados.",
-            periodo_inicial=periodo_inicial,
-            periodo_final=periodo_final,
-            eqt_credora=eqt_credora_val,
-            eqt_devedora=eqt_devedora_val,
-            linhas_processadas=total,
-        )
-    finally:
-        try:
-            cursor_cli.close()
-        finally:
-            conexao_cli.close()
-        try:
-            cursor.close()
-        finally:
-            conexao.close()
 
 # ======================================
 # Endpoints principais
@@ -819,7 +798,17 @@ def upload_import(
                     id_registro,
                     mensagem="Processando dump CDR (preparando importação)...",
                 )
-                periodo_inicial, periodo_final, tabela, novas_tabelas = importar_dump_cdr(path, id_cliente_thread)
+                (
+                    periodo_inicial,
+                    periodo_final,
+                    tabela,
+                    novas_tabelas,
+                    total_cdr,
+                ) = importar_dump_cdr(
+                    caminho_dump=path,
+                    id_cliente=id_cliente_thread,
+                    configuracao_mysql=DBCFG,
+                )
                 mensagem_final = "Dump CDR importado com sucesso."
                 if tabela:
                     mensagem_final += f" Tabela analisada: {tabela}."
@@ -835,9 +824,77 @@ def upload_import(
                     periodo_final=periodo_final,
                     mensagem=mensagem_final,
                     tabela_referencia=tabela,
+                    linhas_processadas=total_cdr,
                 )
+
+                detraf_alvo = None
+                try:
+                    detraf_alvo = _buscar_importacao_recente(id_cliente_thread, "DETRAF")
+                    if detraf_alvo:
+                        conferencia = _executar_conferencia_automatica(
+                            id_cliente=id_cliente_thread,
+                            id_importacao_detraf=detraf_alvo["id"],
+                            periodo_detraf_inicio=detraf_alvo.get("periodo_inicial"),
+                            periodo_detraf_fim=detraf_alvo.get("periodo_final"),
+                            id_importacao_cdr=id_registro,
+                            periodo_cdr_inicio=periodo_inicial,
+                            periodo_cdr_fim=periodo_final,
+                        )
+                        if conferencia:
+                            stats = conferencia.get("resumo", {})
+                            texto = (
+                                f"{mensagem_final} Conferência automática executada "
+                                f"(Conferidos: {stats.get('conferidos', 0)}, "
+                                f"Divergentes: {stats.get('divergentes', 0)}, "
+                                f"Perdidos: {stats.get('perdidos', 0)})."
+                            )
+                            atualizar_controle_importacao(
+                                detraf_alvo["id"],
+                                mensagem=texto,
+                            )
+                except Exception as exc:
+                    alvo = detraf_alvo["id"] if isinstance(detraf_alvo, dict) else id_registro
+                    atualizar_controle_importacao(
+                        alvo,
+                        mensagem=f"Conferência automática (via CDR) falhou: {exc}",
+                    )
             else:
-                processar_arquivo_detraf(path, id_registro, id_cliente_thread)
+                resumo_detraf = processar_arquivo_detraf(
+                    caminho=path,
+                    id_importacao=id_registro,
+                    id_cliente=id_cliente_thread,
+                    obter_conexao_base=db,
+                    atualizar_controle=atualizar_controle_importacao,
+                )
+                resumo_detraf = resumo_detraf or {}
+                mensagem_final = (
+                    "Arquivo DETRAF importado com sucesso. "
+                    f"{resumo_detraf.get('linhas_processadas', 0)} registros processados."
+                )
+                periodo_inicial = resumo_detraf.get("periodo_inicial")
+                periodo_final = resumo_detraf.get("periodo_final")
+
+                try:
+                    conferencia = _executar_conferencia_automatica(
+                        id_cliente=id_cliente_thread,
+                        id_importacao_detraf=id_registro,
+                        periodo_detraf_inicio=periodo_inicial,
+                        periodo_detraf_fim=periodo_final,
+                    )
+                    if conferencia:
+                        stats = conferencia.get("resumo", {})
+                        texto = (
+                            f"{mensagem_final} Conferência automática executada "
+                            f"(Conferidos: {stats.get('conferidos', 0)}, "
+                            f"Divergentes: {stats.get('divergentes', 0)}, "
+                            f"Perdidos: {stats.get('perdidos', 0)})."
+                        )
+                        atualizar_controle_importacao(id_registro, mensagem=texto)
+                except Exception as exc:
+                    atualizar_controle_importacao(
+                        id_registro,
+                        mensagem=f"{mensagem_final} Conferência automática falhou: {exc}",
+                    )
         except Exception as erro:
             atualizar_controle_importacao(
                 id_registro,
@@ -859,6 +916,453 @@ def upload_import(
     ).start()
 
     return {"id": id_importacao, "mensagem": "Importação registrada com sucesso."}
+
+
+# ======================================
+# Conferência - visão e filtros
+# ======================================
+
+
+@app.get("/api/conferencia/importacoes")
+def listar_conferencia_importacoes():
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT ci.id,
+                   ci.id_cliente,
+                   ci.nome_arquivo,
+                   ci.periodo_inicial,
+                   ci.periodo_final,
+                   ci.eqt_credora,
+                   ci.eqt_devedora,
+                   ci.linhas_processadas,
+                   cli.nome_cliente,
+                   COALESCE(SUM(CASE WHEN cr.status = 'CONFERIDO' THEN 1 ELSE 0 END), 0) AS conferidos,
+                   COALESCE(SUM(CASE WHEN cr.status = 'DIVERGENTE' THEN 1 ELSE 0 END), 0) AS divergentes,
+                   COALESCE(SUM(CASE WHEN cr.status = 'PERDIDO' THEN 1 ELSE 0 END), 0) AS perdidos
+            FROM controle_importacoes ci
+            INNER JOIN clientes cli ON cli.id_cliente = ci.id_cliente
+            LEFT JOIN conferencia_resultados cr ON cr.id_importacao_detraf = ci.id
+            WHERE ci.tipo_arquivo = 'DETRAF'
+              AND ci.status <> 'REMOVIDO'
+            GROUP BY ci.id, ci.id_cliente, ci.nome_arquivo, ci.periodo_inicial, ci.periodo_final,
+                     ci.eqt_credora, ci.eqt_devedora, ci.linhas_processadas, cli.nome_cliente
+            ORDER BY ci.data_importacao DESC, ci.id DESC
+            LIMIT 50
+            """
+        )
+        resposta = []
+        for linha in cursor.fetchall():
+            conferidos = int(linha.get("conferidos") or 0)
+            divergentes = int(linha.get("divergentes") or 0)
+            perdidos = int(linha.get("perdidos") or 0)
+            total_resultados = conferidos + divergentes + perdidos
+            processadas = int(linha.get("linhas_processadas") or total_resultados)
+            percentual = round((conferidos / processadas * 100), 1) if processadas else 0.0
+            resposta.append(
+                {
+                    "id": linha["id"],
+                    "id_cliente": linha["id_cliente"],
+                    "cliente": linha.get("nome_cliente"),
+                    "arquivo": linha.get("nome_arquivo"),
+                    "periodo_inicial": linha.get("periodo_inicial"),
+                    "periodo_final": linha.get("periodo_final"),
+                    "eqt_credora": linha.get("eqt_credora"),
+                    "eqt_devedora": linha.get("eqt_devedora"),
+                    "processadas": processadas,
+                    "conferidos": conferidos,
+                    "divergentes": divergentes,
+                    "perdidos": perdidos,
+                    "percentual_conferido": percentual,
+                    "tem_resultados": total_resultados > 0,
+                }
+            )
+        return resposta
+    finally:
+        conexao.close()
+
+
+@app.get("/api/conferencia/cdrs")
+def listar_conferencia_cdrs(id_cliente: int):
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id, nome_arquivo, periodo_inicial, periodo_final, tabela_referencia, data_importacao
+            FROM controle_importacoes
+            WHERE id_cliente = %s AND tipo_arquivo = 'CDR' AND status = 'CONCLUIDO'
+            ORDER BY data_importacao DESC, id DESC
+            LIMIT 50
+            """,
+            (id_cliente,),
+        )
+        return cursor.fetchall()
+    finally:
+        conexao.close()
+
+
+@app.get("/api/conferencia/resumo")
+def obter_conferencia_resumo(id_importacao: int):
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT ci.*, cli.nome_cliente
+            FROM controle_importacoes ci
+            INNER JOIN clientes cli ON cli.id_cliente = ci.id_cliente
+            WHERE ci.id = %s AND ci.tipo_arquivo = 'DETRAF'
+            LIMIT 1
+            """,
+            (id_importacao,),
+        )
+        info = cursor.fetchone()
+        if not info:
+            raise HTTPException(status_code=404, detail="Importação não encontrada para conferência.")
+
+        cursor.execute(
+            """
+            SELECT status, COUNT(1) AS total
+            FROM conferencia_resultados
+            WHERE id_importacao_detraf = %s
+            GROUP BY status
+            """,
+            (id_importacao,),
+        )
+        contagens = {linha["status"]: int(linha["total"] or 0) for linha in cursor.fetchall()}
+        total_resultados = sum(contagens.values())
+        processadas = total_resultados if total_resultados else 0
+        validas = contagens.get("CONFERIDO", 0) if total_resultados else 0
+        invalidas = total_resultados - validas if total_resultados else 0
+
+        ordem_status = ["CONFERIDO", "DIVERGENTE", "PERDIDO"]
+        resumo = []
+        for chave in ordem_status:
+            valor = contagens.get(chave, 0)
+            percentual = round((valor / total_resultados * 100), 1) if total_resultados else 0.0
+            resumo.append({"status": chave, "total": valor, "percentual": percentual})
+
+        cursor.execute(
+            """
+            SELECT descritor, COUNT(1) AS total
+            FROM conferencia_resultados
+            WHERE id_importacao_detraf = %s AND descritor IS NOT NULL AND descritor <> ''
+            GROUP BY descritor
+            ORDER BY total DESC, descritor ASC
+            LIMIT 8
+            """,
+            (id_importacao,),
+        )
+        descritores = [
+            {"valor": linha["descritor"], "quantidade": int(linha["total"] or 0)}
+            for linha in cursor.fetchall()
+        ]
+
+        cursor.execute(
+            """
+            SELECT gh, COUNT(1) AS total
+            FROM conferencia_resultados
+            WHERE id_importacao_detraf = %s AND gh IS NOT NULL AND gh <> ''
+            GROUP BY gh
+            ORDER BY total DESC, gh ASC
+            LIMIT 8
+            """,
+            (id_importacao,),
+        )
+        ghs = [
+            {"valor": linha["gh"], "quantidade": int(linha["total"] or 0)}
+            for linha in cursor.fetchall()
+        ]
+
+        cursor.execute(
+            """
+            SELECT COUNT(1) AS total
+            FROM conferencia_resultados
+            WHERE id_importacao_detraf = %s AND id_registro_cdr IS NULL
+            """,
+            (id_importacao,),
+        )
+        sem_cdr = int(cursor.fetchone()["total"] or 0)
+
+        return {
+            "importacao": {
+                "id": info["id"],
+                "id_cliente": info.get("id_cliente"),
+                "cliente": info.get("nome_cliente"),
+                "arquivo": info.get("nome_arquivo"),
+                "periodo_inicial": info.get("periodo_inicial"),
+                "periodo_final": info.get("periodo_final"),
+                "janela": _formatar_janela(info.get("periodo_inicial"), info.get("periodo_final")),
+                "eqt_credora": info.get("eqt_credora"),
+                "eqt_devedora": info.get("eqt_devedora"),
+            },
+            "status": {
+                "processadas": processadas,
+                "validas": validas,
+                "invalidas": invalidas,
+                "sem_cdr": sem_cdr,
+            },
+            "resumo": resumo,
+            "filtros": {
+                "descritor": descritores,
+                "gh": ghs,
+            },
+        }
+    finally:
+        conexao.close()
+
+
+@app.get("/api/conferencia/resultados")
+def listar_conferencia_resultados(
+    id_importacao: int,
+    pagina: int = 1,
+    limite: int = 25,
+    status: Optional[List[str]] = Query(None),
+    busca: Optional[str] = None,
+    descritor: Optional[str] = None,
+    gh: Optional[str] = None,
+    apenas_sem_cdr: bool = False,
+    diferenca_min: Optional[int] = Query(None, alias="diferenca_min"),
+):
+    pagina = max(1, pagina)
+    limite = max(1, min(limite, 200))
+    offset = (pagina - 1) * limite
+
+    where, parametros = _montar_filtros_conferencia(
+        id_importacao,
+        status,
+        busca,
+        descritor,
+        gh,
+        apenas_sem_cdr,
+        diferenca_min,
+    )
+    total, registros = _consultar_conferencia_resultados(where, parametros, limite, offset)
+
+    itens = []
+    for linha in registros:
+        data_fmt, hora_fmt = _formatar_data_display(linha.get("data_hora"))
+        itens.append(
+            {
+                "id": linha["id"],
+                "status": linha.get("status"),
+                "observacao": linha.get("observacao"),
+                "descricao_divergencia": linha.get("descricao_divergencia"),
+                "assinante_a": linha.get("assinante_a"),
+                "assinante_b": linha.get("assinante_b"),
+                "descritor": linha.get("descritor"),
+                "gh": linha.get("gh"),
+                "data": data_fmt,
+                "hora": hora_fmt,
+                "duracao_detraf": _formatar_segundos(linha.get("duracao_detraf_seg")),
+                "duracao_cdr": _formatar_segundos(linha.get("duracao_cdr_seg")),
+                "eot_detraf": linha.get("eot_detraf"),
+                "eot_cdr": linha.get("eot_cdr"),
+                "id_registro_detraf": linha.get("id_registro_detraf"),
+                "id_registro_cdr": linha.get("id_registro_cdr"),
+                "delta_duracao_seg": linha.get("delta_duracao_seg"),
+                "delta_hora_seg": linha.get("delta_hora_seg"),
+                "tem_cdr": bool(linha.get("id_registro_cdr")),
+            }
+        )
+
+    return {
+        "total": total,
+        "pagina": pagina,
+        "por_pagina": limite,
+        "resultados": itens,
+    }
+
+
+@app.get("/api/conferencia/resultados/{resultado_id}")
+def obter_conferencia_resultado(resultado_id: int):
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id, id_cliente, id_importacao_detraf, id_importacao_cdr,
+                   status, observacao, descricao_divergencia, detalhes_divergencia,
+                   delta_duracao_seg, delta_hora_seg,
+                   assinante_a, assinante_b, descritor, gh, data_hora,
+                   duracao_detraf_seg, duracao_cdr_seg, eot_detraf, eot_cdr,
+                   snapshot_detraf, snapshot_cdr
+            FROM conferencia_resultados
+            WHERE id = %s
+            LIMIT 1
+            """,
+            (resultado_id,),
+        )
+        registro = cursor.fetchone()
+        if not registro:
+            raise HTTPException(status_code=404, detail="Resultado não encontrado.")
+        detalhes = registro.pop("detalhes_divergencia", None)
+        registro["detalhes_divergencia"] = []
+        if detalhes:
+            try:
+                registro["detalhes_divergencia"] = json.loads(detalhes)
+            except (json.JSONDecodeError, TypeError):
+                registro["detalhes_divergencia"] = []
+        detraf = _carregar_snapshot(registro.pop("snapshot_detraf", None))
+        cdr = _carregar_snapshot(registro.pop("snapshot_cdr", None))
+        registro["detraf"] = detraf
+        registro["cdr"] = cdr
+        if not registro["detalhes_divergencia"] and (registro.get("observacao") or registro.get("descricao_divergencia")):
+            registro["detalhes_divergencia"] = [
+                {
+                    "tipo": registro.get("descricao_divergencia") or "informativo",
+                    "mensagem": registro.get("observacao") or "Sem detalhes adicionais.",
+                }
+            ]
+        return registro
+    finally:
+        conexao.close()
+
+
+@app.post("/api/conferencia/processar")
+def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
+    detraf = _obter_importacao(entrada.id_importacao_detraf)
+    if not detraf or detraf.get("tipo_arquivo") != "DETRAF":
+        raise HTTPException(status_code=404, detail="Importação DETRAF não encontrada.")
+    if detraf.get("status") != "CONCLUIDO":
+        raise HTTPException(status_code=400, detail="A importação DETRAF precisa estar concluída.")
+
+    id_cliente = detraf.get("id_cliente")
+    if not id_cliente:
+        raise HTTPException(status_code=400, detail="Importação DETRAF sem cliente associado.")
+
+    if entrada.id_importacao_cdr:
+        cdr = _obter_importacao(entrada.id_importacao_cdr)
+        if not cdr or cdr.get("tipo_arquivo") != "CDR":
+            raise HTTPException(status_code=404, detail="Importação CDR não encontrada.")
+        if cdr.get("id_cliente") != id_cliente:
+            raise HTTPException(status_code=400, detail="CDR pertence a outro cliente.")
+        if cdr.get("status") != "CONCLUIDO":
+            raise HTTPException(status_code=400, detail="Importação CDR precisa estar concluída.")
+    else:
+        cdr = _buscar_importacao_recente(id_cliente, "CDR")
+        if not cdr:
+            raise HTTPException(status_code=400, detail="Nenhuma importação CDR disponível para o cliente.")
+
+    periodo_inicio = detraf.get("periodo_inicial") or cdr.get("periodo_inicial")
+    periodo_fim = detraf.get("periodo_final") or cdr.get("periodo_final")
+
+    exec_id = registrar_execucao_conferencia(id_cliente, detraf["id"], cdr["id"])
+    callback = _callback_execucao(exec_id)
+
+    def _rodar_conferencia():
+        try:
+            resumo = executar_batimento(
+                id_cliente=id_cliente,
+                id_importacao_detraf=detraf["id"],
+                id_importacao_cdr=cdr["id"],
+                periodo_inicio=periodo_inicio,
+                periodo_fim=periodo_fim,
+                notificar_execucao=callback,
+            )
+            atualizar_controle_importacao(
+                detraf["id"],
+                mensagem=(
+                    f"Conferência manual executada com CDR {cdr['nome_arquivo']} (Conferidos: {resumo.get('conferidos', 0)}, "
+                    f"Divergentes: {resumo.get('divergentes', 0)}, Perdidos: {resumo.get('perdidos', 0)})."
+                ),
+            )
+        except Exception as exc:
+            atualizar_execucao_conferencia(
+                exec_id,
+                status_execucao="ERRO",
+                mensagem=str(exc),
+                erro_resumido=str(exc),
+            )
+
+    threading.Thread(target=_rodar_conferencia, daemon=True).start()
+
+    return {
+        "mensagem": "Conferência iniciada.",
+        "id_execucao": exec_id,
+        "id_importacao_cdr": cdr["id"],
+    }
+
+
+@app.get("/api/conferencia/execucoes/{exec_id}")
+def obter_status_execucao(exec_id: int):
+    dados = obter_execucao_conferencia(exec_id)
+    if not dados:
+        raise HTTPException(status_code=404, detail="Execução não encontrada.")
+    return dados
+
+
+@app.get("/api/conferencia/export")
+def exportar_conferencia_resultados(
+    id_importacao: int,
+    status: Optional[List[str]] = Query(None),
+    busca: Optional[str] = None,
+    descritor: Optional[str] = None,
+    gh: Optional[str] = None,
+    apenas_sem_cdr: bool = False,
+    diferenca_min: Optional[int] = Query(None, alias="diferenca_min"),
+):
+    where, parametros = _montar_filtros_conferencia(
+        id_importacao,
+        status,
+        busca,
+        descritor,
+        gh,
+        apenas_sem_cdr,
+        diferenca_min,
+    )
+    total, registros = _consultar_conferencia_resultados(where, parametros, limite=None)
+
+    cabecalho = [
+        "Status",
+        "Data",
+        "Hora",
+        "Assinante A",
+        "Assinante B",
+        "Descritor",
+        "GH",
+        "Duração DETRAF",
+        "Duração CDR",
+        "Delta duração (s)",
+        "Observação",
+    ]
+
+    def gerar():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, delimiter=";")
+        writer.writerow(cabecalho)
+        yield buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        for linha in registros:
+            data_fmt, hora_fmt = _formatar_data_display(linha.get("data_hora"))
+            writer.writerow(
+                [
+                    linha.get("status"),
+                    data_fmt,
+                    hora_fmt,
+                    linha.get("assinante_a"),
+                    linha.get("assinante_b"),
+                    linha.get("descritor"),
+                    linha.get("gh"),
+                    _formatar_segundos(linha.get("duracao_detraf_seg")),
+                    _formatar_segundos(linha.get("duracao_cdr_seg")),
+                    linha.get("delta_duracao_seg"),
+                    linha.get("observacao"),
+                ]
+            )
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+
+    headers = {
+        "Content-Disposition": f"attachment; filename=conferencia_{id_importacao}.csv",
+        "X-Total-Registros": str(total),
+    }
+    return StreamingResponse(gerar(), media_type="text/csv", headers=headers)
 
 
 # ======================================

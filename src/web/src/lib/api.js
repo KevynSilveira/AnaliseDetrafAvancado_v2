@@ -16,13 +16,21 @@ async function request(path, { method='GET', headers={}, body, timeout=30000 } =
 }
 
 export const api = {
-  get: (p) => request(p),
-  post: (p, data) => request(p, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) }),
-  upload: (p, file, fields={}) => {
+  get: (p, opts) => request(p, opts),
+  post: (p, data, opts={}) => {
+    const { headers: extraHeaders = {}, ...rest } = opts || {};
+    return request(p, {
+      method:'POST',
+      headers:{'Content-Type':'application/json', ...extraHeaders},
+      body: JSON.stringify(data),
+      ...rest,
+    });
+  },
+  upload: (p, file, fields={}, opts={}) => {
     const form = new FormData();
     form.append('arquivo', file);
     Object.entries(fields).forEach(([k,v]) => form.append(k, v));
-    return request(p, { method:'POST', body: form });
+    return request(p, { method:'POST', body: form, ...opts });
   },
   delete: (p) => request(p, { method:'DELETE' }),
   put: (p, data) => request(p, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) }),

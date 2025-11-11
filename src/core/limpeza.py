@@ -196,6 +196,14 @@ def limpar_detraf(ids_importacao: List[int], remover_controle: bool) -> Resultad
         f"DELETE FROM detraf_operadora_batimento WHERE id_importacao IN ({placeholders})",
         tuple(ids_importacao),
     )
+    _executar_sql(
+        f"DELETE FROM detraf_normalizado WHERE id_importacao IN ({placeholders})",
+        tuple(ids_importacao),
+    )
+    _executar_sql(
+        f"DELETE FROM conferencia_resultados WHERE id_importacao_detraf IN ({placeholders})",
+        tuple(ids_importacao),
+    )
 
     associados = _mapear_importacoes_por_cliente(ids_importacao)
     removidos_clientes = 0
@@ -232,6 +240,14 @@ def limpar_detraf(ids_importacao: List[int], remover_controle: bool) -> Resultad
                 conexao_cli.close()
 
     if remover_controle:
+        _executar_sql(
+            f"DELETE FROM conferencia_execucoes WHERE id_importacao_detraf IN ({placeholders})",
+            tuple(ids_importacao),
+        )
+        _executar_sql(
+            f"DELETE FROM arquivos_importacao WHERE id_importacao IN ({placeholders})",
+            tuple(ids_importacao),
+        )
         _executar_sql(
             f"DELETE FROM controle_importacoes WHERE id IN ({placeholders})",
             tuple(ids_importacao),
@@ -312,7 +328,20 @@ def limpar_cdr(ids_importacao: List[int], remover_controle: bool) -> ResultadoLi
         tuple(ids_importacao),
     )
 
+    _executar_sql(
+        f"DELETE FROM cdr_normalizado WHERE id_importacao IN ({placeholders})",
+        tuple(ids_importacao),
+    )
+    _executar_sql(
+        f"DELETE FROM conferencia_resultados WHERE id_importacao_cdr IN ({placeholders})",
+        tuple(ids_importacao),
+    )
+
     if remover_controle:
+        _executar_sql(
+            f"DELETE FROM arquivos_importacao WHERE id_importacao IN ({placeholders})",
+            tuple(ids_importacao),
+        )
         _executar_sql(
             f"DELETE FROM controle_importacoes WHERE id IN ({placeholders})",
             tuple(ids_importacao),

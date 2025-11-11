@@ -13,3 +13,14 @@ body {
 .card { @apply rounded-2xl bg-card shadow-soft; }
 .btn { @apply bg-primary hover:bg-red-700 transition-colors text-white px-4 py-2 rounded-lg; }
 .link { @apply text-gray-300 hover:text-white; }
+.btn-secondary { @apply border border-neutral-600/60 text-sm text-gray-200 px-4 py-2 rounded-lg hover:border-primary/60 hover:text-white transition-colors; }
+
+@keyframes progress-slide {
+  0% { transform: translateX(-100%); }
+  50% { transform: translateX(0%); }
+  100% { transform: translateX(100%); }
+}
+
+.progress-indeterminate {
+  animation: progress-slide 1.4s linear infinite;
+}

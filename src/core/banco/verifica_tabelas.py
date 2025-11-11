@@ -42,6 +42,23 @@ def _garantir_coluna(cursor, tabela, coluna, definicao):
         cursor.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {definicao}")
 
 
+def _remover_coluna(cursor, tabela, coluna):
+    """Remove uma coluna, caso exista."""
+    cursor.execute(
+        """
+        SELECT COUNT(1)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+        """,
+        (tabela, coluna),
+    )
+    existe = cursor.fetchone()[0]
+    if existe:
+        cursor.execute(f"ALTER TABLE {tabela} DROP COLUMN {coluna}")
+
+
 def criar_tabela_controle_importacoes():
     """Cria a tabela controle_importacoes (histórico de importações) e garante colunas auxiliares."""
     conexao = obter_conexao()
@@ -123,8 +140,8 @@ def criar_tabela_detraf_operadora_batimento():
     )
     """
     cursor.execute(sql)
-    _garantir_coluna(cursor, "detraf_operadora_batimento", "classificacao", "VARCHAR(20) NULL")
-    _garantir_coluna(cursor, "detraf_operadora_batimento", "tipo_chamada", "VARCHAR(30) NULL")
+    _remover_coluna(cursor, "detraf_operadora_batimento", "classificacao")
+    _remover_coluna(cursor, "detraf_operadora_batimento", "tipo_chamada")
     conexao.commit()
     cursor.close()
     conexao.close()
@@ -179,3 +196,172 @@ def criar_tabela_cdr_tabelas_importadas():
     cursor.close()
     conexao.close()
 print("Tabela cdr_tabelas_importadas criada/verificada com sucesso.")
+
+
+####################################  NORMALIZAÇÃO E CONFERÊNCIA  ####################################
+
+
+def criar_tabela_detraf_normalizado():
+    conexao = obter_conexao()
+    cursor = conexao.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS detraf_normalizado (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            id_cliente INT NOT NULL,
+            id_importacao INT NOT NULL,
+            id_registro INT NOT NULL,
+            sequencial VARCHAR(30) NULL,
+            data_hora DATETIME NULL,
+            data_referencia DATE NULL,
+            hora_segundos INT NULL,
+            duracao_segundos INT DEFAULT 0,
+            duracao_calculada_seg INT DEFAULT 0,
+            assinante_a_norm VARCHAR(32) NULL,
+            assinante_b_norm VARCHAR(32) NULL,
+            descritor VARCHAR(10) NULL,
+            gh CHAR(1) NULL,
+            eot_credora CHAR(3) NULL,
+            eot_devedora CHAR(3) NULL,
+            poi VARCHAR(15) NULL,
+            chave_batimento VARCHAR(255) NULL,
+            snapshot LONGTEXT NULL,
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_detraf_norm_importacao (id_importacao),
+            INDEX idx_detraf_norm_cliente (id_cliente),
+            INDEX idx_detraf_norm_chave (chave_batimento),
+            INDEX idx_detraf_norm_data (data_hora)
+        )
+        """
+    )
+    conexao.commit()
+    cursor.close()
+    conexao.close()
+    print("Tabela detraf_normalizado criada/verificada com sucesso.")
+
+
+def criar_tabela_cdr_normalizado():
+    conexao = obter_conexao()
+    cursor = conexao.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cdr_normalizado (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            id_cliente INT NOT NULL,
+            id_importacao INT NOT NULL,
+            id_registro VARCHAR(64) NOT NULL,
+            data_hora DATETIME NULL,
+            data_referencia DATE NULL,
+            hora_segundos INT NULL,
+            duracao_segundos INT DEFAULT 0,
+            caller_norm VARCHAR(32) NULL,
+            callee_norm VARCHAR(32) NULL,
+            descritor VARCHAR(20) NULL,
+            gh CHAR(1) NULL,
+            eot VARCHAR(10) NULL,
+            chave_batimento VARCHAR(255) NULL,
+            snapshot LONGTEXT NULL,
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_cdr_norm_importacao (id_importacao),
+            INDEX idx_cdr_norm_cliente (id_cliente),
+            INDEX idx_cdr_norm_chave (chave_batimento),
+            INDEX idx_cdr_norm_data (data_hora)
+        )
+        """
+    )
+    conexao.commit()
+    cursor.close()
+    conexao.close()
+    print("Tabela cdr_normalizado criada/verificada com sucesso.")
+
+
+def criar_tabela_conferencia_resultados():
+    conexao = obter_conexao()
+    cursor = conexao.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conferencia_resultados (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            id_cliente INT NOT NULL,
+            id_importacao_detraf INT NOT NULL,
+            id_importacao_cdr INT NULL,
+            id_registro_detraf INT NOT NULL,
+            id_registro_cdr VARCHAR(64) NULL,
+            status ENUM('CONFERIDO','DIVERGENTE','PERDIDO') NOT NULL,
+            delta_duracao_seg INT NULL,
+            delta_hora_seg INT NULL,
+            descricao_divergencia VARCHAR(255) NULL,
+            observacao VARCHAR(255) NULL,
+            detalhes_divergencia LONGTEXT NULL,
+            chave_batimento VARCHAR(255) NULL,
+            descritor VARCHAR(10) NULL,
+            gh CHAR(1) NULL,
+            assinante_a VARCHAR(32) NULL,
+            assinante_b VARCHAR(32) NULL,
+            data_hora DATETIME NULL,
+            duracao_detraf_seg INT DEFAULT 0,
+            duracao_cdr_seg INT DEFAULT 0,
+            eot_detraf CHAR(3) NULL,
+            eot_cdr CHAR(3) NULL,
+            snapshot_detraf LONGTEXT NULL,
+            snapshot_cdr LONGTEXT NULL,
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_conf_res_importacao (id_importacao_detraf),
+            INDEX idx_conf_res_status (status),
+            INDEX idx_conf_res_cliente (id_cliente)
+        )
+        """
+    )
+    conexao.commit()
+
+    cursor.execute(
+        """
+        SELECT COUNT(1)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'conferencia_resultados'
+          AND COLUMN_NAME = 'detalhes_divergencia'
+        """
+    )
+    possui_coluna = cursor.fetchone()
+    if not possui_coluna or not possui_coluna[0]:
+        cursor.execute(
+            """
+            ALTER TABLE conferencia_resultados
+            ADD COLUMN detalhes_divergencia LONGTEXT NULL AFTER observacao
+            """
+        )
+        conexao.commit()
+    cursor.close()
+    conexao.close()
+    print("Tabela conferencia_resultados criada/verificada com sucesso.")
+
+
+def criar_tabela_conferencia_execucoes():
+    conexao = obter_conexao()
+    cursor = conexao.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conferencia_execucoes (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            id_cliente INT NOT NULL,
+            id_importacao_detraf INT NOT NULL,
+            id_importacao_cdr INT NULL,
+            status_execucao ENUM('PENDENTE','NORMALIZANDO_DETRAF','NORMALIZANDO_CDR','BATENDO_REGISTROS','GRAVANDO_RESULTADOS','CONCLUIDO','ERRO') DEFAULT 'PENDENTE',
+            etapa_atual VARCHAR(100) NULL,
+            progresso_percentual INT DEFAULT 0,
+            mensagem VARCHAR(255) NULL,
+            total_registros INT DEFAULT 0,
+            processados INT DEFAULT 0,
+            criado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
+            atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            erro_resumido TEXT NULL,
+            FOREIGN KEY (id_importacao_detraf) REFERENCES controle_importacoes(id)
+        )
+        """
+    )
+    conexao.commit()
+    cursor.close()
+    conexao.close()
+    print("Tabela conferencia_execucoes criada/verificada com sucesso.")

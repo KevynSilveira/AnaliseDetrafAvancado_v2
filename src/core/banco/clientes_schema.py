@@ -76,13 +76,30 @@ CREATE TABLE IF NOT EXISTS detraf_operadora_batimento (
     eqt_credora CHAR(3),
     eqt_devedora CHAR(3),
     importado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
-    classificacao VARCHAR(20) NULL,
-    tipo_chamada VARCHAR(30) NULL,
     INDEX idx_descritor (descritor_cdr),
     INDEX idx_data (data_chamada),
     INDEX idx_gh (gh)
 )
 """
+
+
+def _coluna_existe(cursor, tabela: str, coluna: str) -> bool:
+    cursor.execute(
+        """
+        SELECT COUNT(1)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+        """,
+        (tabela, coluna),
+    )
+    return bool(cursor.fetchone()[0])
+
+
+def _remover_coluna(cursor, tabela: str, coluna: str) -> None:
+    if _coluna_existe(cursor, tabela, coluna):
+        cursor.execute(f"ALTER TABLE {tabela} DROP COLUMN {coluna}")
 
 
 def _normalizar_nome_banco(nome: str) -> str:
@@ -167,6 +184,8 @@ def _garantir_banco_existente(nome_banco: str) -> None:
     try:
         cursor = conexao.cursor()
         cursor.execute(SQL_TABELA_DETRAF_CLIENTE)
+        _remover_coluna(cursor, "detraf_operadora_batimento", "classificacao")
+        _remover_coluna(cursor, "detraf_operadora_batimento", "tipo_chamada")
         conexao.commit()
     finally:
         conexao.close()

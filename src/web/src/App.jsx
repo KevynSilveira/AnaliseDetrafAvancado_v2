@@ -1,7 +1,7 @@
 // App com navegação
 import React from "react";
 import { Routes, Route, NavLink } from "react-router-dom";
-import Dashboard from "./pages/Dashboard";
+import Validacao from "./pages/Validacao";
 import Imports from "./pages/Imports";
 import Reports from "./pages/Reports";
 import Configuracoes from "./pages/Configuracoes";
@@ -16,7 +16,7 @@ export default function App() {
             <span className="text-sm text-gray-300">Conferência V2</span>
           </div>
           <div className="flex gap-4">
-            <NavLink to="/" end className={({isActive}) => isActive ? "text-white" : "link"}>Dashboard</NavLink>
+            <NavLink to="/" end className={({isActive}) => isActive ? "text-white" : "link"}>Validação</NavLink>
             <NavLink to="/importacoes" className={({isActive}) => isActive ? "text-white" : "link"}>Importações</NavLink>
             <NavLink to="/relatorios" className={({isActive}) => isActive ? "text-white" : "link"}>Relatórios</NavLink>
             <NavLink to="/configuracoes" className={({isActive}) => isActive ? "text-white" : "link"}>Configurações</NavLink>
@@ -26,7 +26,7 @@ export default function App() {
 
       <main className="max-w-6xl mx-auto p-4 md:p-8">
         <Routes>
-          <Route path="/" element={<Dashboard />} />
+          <Route path="/" element={<Validacao />} />
           <Route path="/importacoes" element={<Imports />} />
           <Route path="/relatorios" element={<Reports />} />
           <Route path="/configuracoes" element={<Configuracoes />} />
