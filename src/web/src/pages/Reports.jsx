@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api, API_BASE } from "../lib/api";
+import { obterClasseMensagem } from "../lib/mensagens";
 
 const formatarData = (valor) => {
   if (!valor) return "-";
@@ -148,7 +149,7 @@ export default function Reports() {
         </div>
 
         {mensagem && (
-          <div className="rounded-lg border border-primary/40 bg-primary/10 p-3 text-sm text-primary">
+          <div className={`rounded-lg border p-3 text-sm ${obterClasseMensagem(mensagem)}`}>
             {mensagem}
           </div>
         )}

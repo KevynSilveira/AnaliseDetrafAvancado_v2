@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
+import { obterClasseMensagem } from "../lib/mensagens";
 
 const formatarBytes = (valor) => {
   if (!Number.isFinite(valor) || valor <= 0) return "0 B";
@@ -18,6 +19,42 @@ const formatarDescricaoImportacao = (item) => {
   const tipo = item.tipo_arquivo || "-";
   const arquivo = item.nome_arquivo || "arquivo";
   return `${cliente} • ${tipo} • ${arquivo}`;
+};
+
+const RESUMO_MAPA = {
+  LOGS: "Logs",
+  TMP: "Arquivos temporários",
+  DETRAF: "Registros DETRAF",
+  CDR: "Tabelas CDR",
+};
+
+const DETALHE_LABELS = {
+  removidos: "Removidos",
+  mantidos: "Mantidos",
+  total: "Total",
+  registros_base: "Registros base",
+  clientes: "Clientes",
+  registros_clientes: "Registros (clientes)",
+  limpezas_sucesso: "Execuções bem-sucedidas",
+};
+
+const formatarResumoDetalhes = (detalhes) => {
+  const entradas = Object.entries(detalhes || {});
+  if (!entradas.length) {
+    return [
+      <div key="vazio" className="text-xs text-gray-500">
+        Nenhuma alteração registrada.
+      </div>,
+    ];
+  }
+  return entradas.map(([chave, valor]) => (
+    <div key={chave} className="flex items-center justify-between text-sm text-gray-200">
+      <span className="text-gray-400">{DETALHE_LABELS[chave] || chave}</span>
+      <span className="font-semibold">
+        {typeof valor === "number" ? valor.toLocaleString("pt-BR") : String(valor)}
+      </span>
+    </div>
+  ));
 };
 
 export default function Configuracoes() {
@@ -159,6 +196,14 @@ export default function Configuracoes() {
     .filter(([, ativo]) => ativo)
     .map(([chave]) => chave);
 
+  useEffect(() => {
+    const tituloAnterior = document.title;
+    document.title = "DETRAF | Limpeza e Manutenção";
+    return () => {
+      document.title = tituloAnterior || "DETRAF Conferência V2";
+    };
+  }, []);
+
   const executarLimpeza = async () => {
     if (!selecionados.length) {
       setMensagem("Selecione ao menos uma área para limpar.");
@@ -204,12 +249,14 @@ export default function Configuracoes() {
       setProcessando(true);
       setMensagem("");
       const resposta = await api.post("/api/limpeza/manual", payload, { timeout: 180000 });
-      setMensagem(resposta?.mensagem || "Limpeza concluída.");
+      const textoSucesso = resposta?.mensagem || "Limpeza concluída com sucesso.";
+      setMensagem(textoSucesso);
       setResultadoResumo(resposta?.resultados || []);
       setSelecionarImportacoes([]);
       await Promise.all([carregarResumo(), carregarImportacoes()]);
     } catch (erro) {
-      setMensagem(erro.message || "Falha ao executar a limpeza.");
+      const textoErro = erro.message || "Falha ao executar a limpeza.";
+      setMensagem(textoErro);
       setResultadoResumo([]);
     } finally {
       setProcessando(false);
@@ -391,16 +438,18 @@ export default function Configuracoes() {
           </div>
 
           {(mensagem || resultadoResumo.length) && (
-            <div className="rounded-lg border border-primary/40 bg-primary/10 p-3 text-sm text-primary space-y-2">
-              {mensagem && <div>{mensagem}</div>}
+            <div className={`rounded-xl border p-4 text-sm space-y-3 ${obterClasseMensagem(mensagem || (resultadoResumo.length ? "informativo" : ""))}`}>
+              {mensagem && <div className="font-semibold">{mensagem}</div>}
               {resultadoResumo.length > 0 && (
-                <div className="text-gray-100">
+                <div className="space-y-3">
                   {resultadoResumo.map((item) => (
-                    <div key={item.tipo} className="text-xs">
-                      <span className="font-semibold">{item.tipo}:</span>{" "}
-                      {Object.entries(item.detalhes || {})
-                        .map(([campo, valor]) => `${campo}=${valor}`)
-                        .join(", ") || "sem alterações"}
+                    <div key={item.tipo} className="rounded-lg border border-neutral-700 bg-neutral-950/40 p-3">
+                      <div className="text-xs uppercase tracking-wide text-gray-400">
+                        {RESUMO_MAPA[item.tipo] || item.tipo}
+                      </div>
+                      <div className="mt-2 space-y-1">
+                        {formatarResumoDetalhes(item.detalhes)}
+                      </div>
                     </div>
                   ))}
                 </div>

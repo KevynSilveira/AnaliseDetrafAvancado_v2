@@ -3,9 +3,22 @@ const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 async function request(path, { method='GET', headers={}, body, timeout=30000 } = {}) {
   const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeout);
-  const res = await fetch(BASE + path, { method, headers, body, signal: ctrl.signal });
-  clearTimeout(id);
+  const timeoutMs = typeof timeout === 'number' ? timeout : 30000;
+  let timerId = null;
+  if (timeoutMs > 0) {
+    timerId = setTimeout(() => ctrl.abort(), timeoutMs);
+  }
+  let res;
+  try {
+    res = await fetch(BASE + path, { method, headers, body, signal: ctrl.signal });
+  } catch (err) {
+    if (timerId) clearTimeout(timerId);
+    if (err?.name === 'AbortError') {
+      throw new Error('Requisição cancelada por tempo excedido.');
+    }
+    throw err;
+  }
+  if (timerId) clearTimeout(timerId);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || ('HTTP ' + res.status));
@@ -30,7 +43,9 @@ export const api = {
     const form = new FormData();
     form.append('arquivo', file);
     Object.entries(fields).forEach(([k,v]) => form.append(k, v));
-    return request(p, { method:'POST', body: form, ...opts });
+    const { timeout, ...rest } = opts || {};
+    const uploadTimeout = timeout ?? 0; // 0 = sem timeout (útil para arquivos grandes)
+    return request(p, { method:'POST', body: form, timeout: uploadTimeout, ...rest });
   },
   delete: (p) => request(p, { method:'DELETE' }),
   put: (p, data) => request(p, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) }),

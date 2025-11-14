@@ -1,6 +1,7 @@
 // Importações com API, sem hardcode
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
+import { obterClasseMensagem } from "../lib/mensagens";
 
 const mensagensStatus = {
   PROCESSANDO: "Processando",
@@ -268,7 +269,7 @@ export default function Imports() {
         </div>
 
         {mensagemPainel && (
-          <div className="rounded-lg border border-primary/40 bg-primary/10 p-3 text-sm text-primary">
+          <div className={`rounded-lg border p-3 text-sm ${obterClasseMensagem(mensagemPainel)}`}>
             {mensagemPainel}
           </div>
         )}

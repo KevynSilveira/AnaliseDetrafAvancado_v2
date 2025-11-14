@@ -13,11 +13,14 @@ import json
 import os
 import re
 import threading
+import logging
+from logging.handlers import RotatingFileHandler
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,7 +53,7 @@ from src.core.limpeza import (
     registrar_execucao,
     buscar_importacoes,
 )
-from src.core.faz_batimento import executar_batimento
+from src.core.faz_batimento import executar_batimento, TOLERANCIA_DURACAO_SEG
 from src.core.importadores.importador_cdr import importar_dump_cdr
 from src.core.importadores.importador_detraf import processar_arquivo_detraf
 
@@ -81,6 +84,52 @@ VAR_DIR = BASE_DIR / os.getenv("VAR_DIR", "var")
 (VAR_DIR / "tmp").mkdir(parents=True, exist_ok=True)
 LOG_DIR = VAR_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# ======================================
+# Logging centralizado
+# ======================================
+LOG_FILE = LOG_DIR / "api_conferencia.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+logger = logging.getLogger("api_conferencia")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+
+def _serializar_para_log(valor):
+    if isinstance(valor, (datetime, date, time)):
+        return valor.isoformat()
+    if isinstance(valor, (list, tuple)):
+        return [_serializar_para_log(v) for v in valor]
+    if isinstance(valor, dict):
+        return {k: _serializar_para_log(v) for k, v in valor.items()}
+    try:
+        json.dumps(valor)
+        return valor
+    except (TypeError, ValueError):
+        return str(valor)
+
+
+def registrar_log(evento: str, **contexto):
+    dados = {chave: _serializar_para_log(valor) for chave, valor in contexto.items()}
+    try:
+        logger.info("%s | %s", evento, json.dumps(dados, ensure_ascii=False))
+    except Exception as exc:  # pragma: no cover - log de fallback
+        logger.warning("Falha ao registrar log (%s): %s", evento, exc)
+
+
+def _registrar_sql_erro(evento: str, sql: str, parametros, erro: Exception):
+    registrar_log(
+        evento,
+        sql=sql,
+        placeholders=sql.count("%s"),
+        parametros=_serializar_para_log(parametros),
+        erro=str(erro),
+    )
 
 # Cria pool de conexões
 pool = MySQLConnectionPool(pool_name="detraf_pool", pool_size=5, **DBCFG)
@@ -172,6 +221,7 @@ class LimpezaManualEntrada(BaseModel):
 class ConferenciaProcessarEntrada(BaseModel):
     id_importacao_detraf: int
     id_importacao_cdr: Optional[int] = None
+    forcar_normalizacao: bool = False
 
 
 def atualizar_controle_importacao(id_importacao: int, **campos):
@@ -413,6 +463,18 @@ def _formatar_janela(inicio: Optional[date], fim: Optional[date]) -> str:
     return ref.strftime("%Y%m") if ref else "--"
 
 
+def _parse_data_param(valor: Optional[str]) -> Optional[datetime]:
+    if not valor:
+        return None
+    try:
+        return datetime.fromisoformat(valor)
+    except ValueError:
+        try:
+            return datetime.strptime(valor, "%Y-%m-%d")
+        except ValueError:
+            return None
+
+
 def _montar_filtros_conferencia(
     id_importacao: int,
     status: Optional[List[str]],
@@ -421,13 +483,28 @@ def _montar_filtros_conferencia(
     gh: Optional[str],
     apenas_sem_cdr: bool,
     diferenca_min: Optional[int],
+    eot_divergente: bool = False,
+    cruza_gh: bool = False,
+    tarifa: Optional[str] = None,
+    assinante_a: Optional[str] = None,
+    assinante_b: Optional[str] = None,
+    data_inicio: Optional[str] = None,
+    data_fim: Optional[str] = None,
+    multi_divergencias: bool = False,
+    gh_inconsistente: bool = False,
+    sigame: bool = False,
 ):
-    condicoes = ["id_importacao_detraf = %s"]
+    tabela = "conferencia_resultados"
+
+    def col(nome: str) -> str:
+        return f"{tabela}.{nome}"
+
+    condicoes = [f"{col('id_importacao_detraf')} = %s"]
     parametros: List = [id_importacao]
 
     status_filtrados = _filtrar_status_param(status)
     if status_filtrados:
-        condicoes.append("status IN (" + ",".join(["%s"] * len(status_filtrados)) + ")")
+        condicoes.append(f"{col('status')} IN (" + ",".join(["%s"] * len(status_filtrados)) + ")")
         parametros.extend(status_filtrados)
 
     if busca:
@@ -435,31 +512,145 @@ def _montar_filtros_conferencia(
         termo_digits = re.sub(r"\D", "", termo)
         alvo = termo_digits or termo
         if alvo:
-            condicoes.append("(assinante_a LIKE %s OR assinante_b LIKE %s)")
+            condicoes.append(f"({col('assinante_a')} LIKE %s OR {col('assinante_b')} LIKE %s)")
             like = f"%{alvo}%"
             parametros.extend([like, like])
 
     if descritor:
-        condicoes.append("descritor = %s")
+        condicoes.append(f"{col('descritor')} = %s")
         parametros.append(descritor.strip().upper())
 
     if gh:
-        condicoes.append("gh = %s")
+        condicoes.append(f"{col('gh')} = %s")
         parametros.append(gh.strip().upper())
 
     if apenas_sem_cdr:
-        condicoes.append("id_registro_cdr IS NULL")
+        condicoes.append(f"{col('id_registro_cdr')} IS NULL")
 
     if diferenca_min is not None:
-        condicoes.append("delta_duracao_seg >= %s")
+        condicoes.append(f"{col('delta_duracao_seg')} > %s")
         parametros.append(int(diferenca_min))
 
+    if eot_divergente:
+        condicoes.append(
+            f"""(
+                {col('eot_detraf')} IS NOT NULL AND {col('eot_cdr')} IS NOT NULL
+                AND UPPER(TRIM({col('eot_detraf')})) <> UPPER(TRIM({col('eot_cdr')}))
+            )"""
+        )
+
+    if cruza_gh:
+        condicoes.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM detraf_normalizado dn
+                WHERE dn.id_importacao = {tabela}.id_importacao_detraf
+                  AND dn.id_registro = {tabela}.id_registro_detraf
+                  AND dn.segundos_gh_normal > 0
+                  AND dn.segundos_gh_reduzido > 0
+            )
+            """
+        )
+
+    if gh_inconsistente:
+        condicoes.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM detraf_normalizado dn
+                WHERE dn.id_importacao = {tabela}.id_importacao_detraf
+                  AND dn.id_registro = {tabela}.id_registro_detraf
+                  AND (
+                      (UPPER(COALESCE(dn.gh,'')) = 'N' AND dn.segundos_gh_reduzido > 0)
+                      OR (UPPER(COALESCE(dn.gh,'')) = 'R' AND dn.segundos_gh_normal > 0)
+                  )
+            )
+            """
+        )
+
+    if sigame:
+        condicoes.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM detraf_normalizado dn
+                WHERE dn.id_importacao = {tabela}.id_importacao_detraf
+                  AND dn.id_registro = {tabela}.id_registro_detraf
+                  AND COALESCE(dn.flag_sigame, 0) = 1
+            )
+            """
+        )
+
+    if tarifa:
+        tarifa_limpa = tarifa.strip().upper()
+        if tarifa_limpa == "CNG":
+            condicoes.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM detraf_normalizado dn
+                    WHERE dn.id_importacao = {tabela}.id_importacao_detraf
+                      AND dn.id_registro = {tabela}.id_registro_detraf
+                      AND (
+                          UPPER(COALESCE(dn.poi,'')) = 'CNG'
+                          OR dn.assinante_b_norm LIKE '0800%%'
+                          OR dn.assinante_b_norm LIKE '800%%'
+                      )
+                )
+                """
+            )
+        else:
+            condicoes.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM detraf_normalizado dn
+                    WHERE dn.id_importacao = {tabela}.id_importacao_detraf
+                      AND dn.id_registro = {tabela}.id_registro_detraf
+                      AND UPPER(COALESCE(dn.tarifa_aplicada,'')) = %s
+                )
+                """
+            )
+            parametros.append(tarifa_limpa)
+
+    if assinante_a:
+        condicoes.append(f"{col('assinante_a')} LIKE %s")
+        parametros.append(f"%{assinante_a.strip()}%")
+
+    if assinante_b:
+        condicoes.append(f"{col('assinante_b')} LIKE %s")
+        parametros.append(f"%{assinante_b.strip()}%")
+
+    inicio_dt = _parse_data_param(data_inicio)
+    fim_dt = _parse_data_param(data_fim)
+    if inicio_dt:
+        condicoes.append(f"{col('data_hora')} >= %s")
+        parametros.append(inicio_dt)
+    if fim_dt:
+        condicoes.append(f"{col('data_hora')} <= %s")
+        parametros.append(fim_dt)
+
+    if multi_divergencias:
+        condicoes.append(
+            f"""
+            (
+                {col('detalhes_divergencia')} IS NOT NULL
+                AND {col('detalhes_divergencia')} <> ''
+                AND JSON_VALID({col('detalhes_divergencia')})
+                AND JSON_LENGTH({col('detalhes_divergencia')}) > 1
+            )
+            """
+        )
+
     where = " AND ".join(condicoes)
-    return where, parametros
+    where_alias = where.replace(f"{tabela}.", "cr.")
+    return where, where_alias, parametros
 
 
 def _consultar_conferencia_resultados(
     where: str,
+    where_alias: str,  # mantido para compatibilidade futura
     parametros: List,
     limite: Optional[int],
     offset: int = 0,
@@ -467,27 +658,57 @@ def _consultar_conferencia_resultados(
     conexao = db()
     try:
         cursor = conexao.cursor(dictionary=True)
-        cursor.execute(
-            f"SELECT COUNT(1) AS total FROM conferencia_resultados WHERE {where}",
-            tuple(parametros),
-        )
+        sql_count = f"SELECT COUNT(1) AS total FROM conferencia_resultados WHERE {where}"
+        try:
+            cursor.execute(sql_count, tuple(parametros))
+        except mysql.connector.Error as exc:
+            _registrar_sql_erro("sql_count_erro", sql_count, parametros, exc)
+            raise
         total = int(cursor.fetchone()["total"] or 0)
 
         consulta_sql = (
             f"""
-            SELECT id, status, observacao, descricao_divergencia, assinante_a, assinante_b, descritor, gh,
-                   data_hora, duracao_detraf_seg, duracao_cdr_seg, eot_detraf, eot_cdr,
-                   delta_duracao_seg, delta_hora_seg, id_registro_detraf, id_registro_cdr
+            SELECT
+                conferencia_resultados.id,
+                conferencia_resultados.status,
+                conferencia_resultados.observacao,
+                conferencia_resultados.descricao_divergencia,
+                conferencia_resultados.detalhes_divergencia,
+                conferencia_resultados.snapshot_cdr,
+                conferencia_resultados.assinante_a,
+                conferencia_resultados.assinante_b,
+                conferencia_resultados.descritor,
+                conferencia_resultados.gh,
+                conferencia_resultados.data_hora,
+                conferencia_resultados.duracao_detraf_seg,
+                conferencia_resultados.duracao_cdr_seg,
+                conferencia_resultados.eot_detraf,
+                conferencia_resultados.eot_cdr,
+                conferencia_resultados.delta_duracao_seg,
+                conferencia_resultados.delta_hora_seg,
+                conferencia_resultados.id_registro_detraf,
+                conferencia_resultados.id_registro_cdr,
+                COALESCE(dn.flag_sigame, 0) AS flag_sigame,
+                dn.assinante_b_sigame_norm
             FROM conferencia_resultados
+            LEFT JOIN detraf_normalizado dn
+              ON dn.id_importacao = conferencia_resultados.id_importacao_detraf
+             AND dn.id_registro = conferencia_resultados.id_registro_detraf
             WHERE {where}
-            ORDER BY FIELD(status,'CONFERIDO','DIVERGENTE','PERDIDO'), data_hora ASC, id ASC
+            ORDER BY FIELD(conferencia_resultados.status,'CONFERIDO','DIVERGENTE','PERDIDO'),
+                     conferencia_resultados.data_hora ASC,
+                     conferencia_resultados.id ASC
             """
         )
         consulta_parametros = list(parametros)
         if limite is not None:
             consulta_sql += " LIMIT %s OFFSET %s"
             consulta_parametros.extend([limite, offset])
-        cursor.execute(consulta_sql, tuple(consulta_parametros))
+        try:
+            cursor.execute(consulta_sql, tuple(consulta_parametros))
+        except mysql.connector.Error as exc:
+            _registrar_sql_erro("sql_listagem_erro", consulta_sql, consulta_parametros, exc)
+            raise
         registros = cursor.fetchall()
         return total, registros
     finally:
@@ -503,6 +724,100 @@ def _carregar_snapshot(payload):
         return json.loads(payload)
     except (TypeError, json.JSONDecodeError):
         return {"raw": payload}
+
+
+def _obter_disposition_cdr(snapshot_payload) -> str:
+    if not snapshot_payload:
+        return ""
+    dados = snapshot_payload if isinstance(snapshot_payload, dict) else _carregar_snapshot(snapshot_payload)
+    if not dados:
+        return ""
+    valor = (
+        dados.get("disposition")
+        or dados.get("Disposition")
+        or dados.get("DISPOSITION")
+        or dados.get("cdr_disposition")
+    )
+    return str(valor).strip().upper() if valor else ""
+
+
+def _filtrar_detalhes_divergencia(
+    detalhes_raw,
+    disposition: str,
+) -> Tuple[List[dict], List[str], bool]:
+    if not detalhes_raw:
+        return [], [], False
+    if isinstance(detalhes_raw, str):
+        try:
+            detalhes = json.loads(detalhes_raw)
+        except (json.JSONDecodeError, TypeError):
+            detalhes = []
+    else:
+        detalhes = detalhes_raw
+    if not isinstance(detalhes, list):
+        return [], [], False
+    ignorar_eot = disposition and disposition != "ANSWERED"
+    detalhes_filtrados: List[dict] = []
+    tipos_filtrados: List[str] = []
+    possui_eot_considerado = False
+    for item in detalhes:
+        if not isinstance(item, dict):
+            continue
+        tipo = (item.get("tipo") or "divergência").strip() or "divergência"
+        eh_eot = tipo.lower() == "eot"
+        if eh_eot:
+            if ignorar_eot:
+                continue
+            possui_eot_considerado = True
+        detalhes_filtrados.append(item)
+        tipos_filtrados.append(tipo)
+        return detalhes_filtrados, tipos_filtrados, possui_eot_considerado
+
+
+def _preencher_partes_detraf(partes: list):
+    if not partes:
+        return
+    precisam_busca = [parte for parte in partes if parte.get("id") and not parte.get("assinante_a")]
+    if not precisam_busca:
+        return
+    ids = [parte.get("id") for parte in precisam_busca if parte.get("id")]
+    if not ids:
+        return
+    placeholders = ",".join(["%s"] * len(ids))
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            f"""
+            SELECT id, sequencial, assinante_a, assinante_b, data_chamada, hora_atendimento,
+                   gh, duracao_real_segundos, duracao_calculada, eqt_credora, eqt_devedora,
+                   poi, valor_remuneracao
+            FROM detraf_operadora_batimento
+            WHERE id IN ({placeholders})
+            """,
+            ids,
+        )
+        registros = {linha["id"]: linha for linha in cursor.fetchall()}
+    finally:
+        conexao.close()
+
+    for parte in partes:
+        origem = registros.get(parte.get("id"))
+        if not origem:
+            continue
+        parte["sequencial"] = origem.get("sequencial") or parte.get("sequencial")
+        parte["assinante_a"] = origem.get("assinante_a") or parte.get("assinante_a")
+        parte["assinante_b"] = origem.get("assinante_b") or parte.get("assinante_b")
+        parte["data_chamada"] = str(origem.get("data_chamada") or parte.get("data_chamada") or "")
+        parte["hora_atendimento"] = str(origem.get("hora_atendimento") or parte.get("hora_atendimento") or "")
+        parte["poi"] = origem.get("poi") or parte.get("poi")
+        parte["eqt_credora"] = origem.get("eqt_credora") or parte.get("eqt_credora")
+        parte["eqt_devedora"] = origem.get("eqt_devedora") or parte.get("eqt_devedora")
+        parte["valor_remuneracao"] = origem.get("valor_remuneracao") if origem.get("valor_remuneracao") is not None else parte.get("valor_remuneracao")
+        parte["duracao_real_segundos"] = int(origem.get("duracao_real_segundos") or parte.get("duracao_real_segundos") or 0)
+        calc = origem.get("duracao_calculada")
+        if calc is not None:
+            parte["duracao_calculada_seg"] = int(round(float(calc) * 60))
 
 
 def marcar_arquivo_removido(caminho: Path) -> None:
@@ -1101,10 +1416,35 @@ def obter_conferencia_resumo(id_importacao: int):
         )
         sem_cdr = int(cursor.fetchone()["total"] or 0)
 
+        dashboard_metricas = {}
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS total_registros,
+                   COUNT(DISTINCT CONCAT_WS('|',
+                       COALESCE(assinante_a,''),
+                       COALESCE(assinante_b,''),
+                       DATE_FORMAT(data_chamada,'%Y-%m-%d'),
+                       COALESCE(hora_atendimento,'')
+                   )) AS total_chamadas,
+                   SUM(duracao_real_segundos) AS seg_arquivo
+            FROM detraf_operadora_batimento
+            WHERE id_importacao = %s
+            """,
+            (id_importacao,),
+        )
+        arquivo_info = cursor.fetchone() or {}
+        dashboard_metricas["arquivo"] = {
+            "registros": int(arquivo_info.get("total_registros") or 0),
+            "chamadas": int(arquivo_info.get("total_chamadas") or 0),
+            "segundos_totais": int(arquivo_info.get("seg_arquivo") or 0),
+        }
+
         cursor.execute(
             """
             SELECT
                 SUM(CASE WHEN gh = 'R' THEN duracao_segundos ELSE 0 END) AS seg_reduz_cob,
+                SUM(CASE WHEN gh = 'N' THEN duracao_segundos ELSE 0 END) AS seg_normal_cob,
                 SUM(segundos_gh_normal) AS seg_normal_val,
                 SUM(segundos_gh_reduzido) AS seg_reduz_val
             FROM detraf_normalizado
@@ -1115,9 +1455,204 @@ def obter_conferencia_resumo(id_importacao: int):
         metrica = cursor.fetchone() or {}
         gh_metricas = {
             "segundos_reduzidos_cobrados": int(metrica.get("seg_reduz_cob") or 0),
+            "segundos_normais_cobrados": int(metrica.get("seg_normal_cob") or 0),
             "segundos_reduzidos_validados": int(metrica.get("seg_reduz_val") or 0),
             "segundos_normais_validados": int(metrica.get("seg_normal_val") or 0),
         }
+
+        cursor.execute(
+            """
+            SELECT
+                SUM(duracao_detraf_seg) AS seg_total,
+                SUM(CASE WHEN status = 'CONFERIDO' THEN duracao_detraf_seg ELSE 0 END) AS seg_validos,
+                SUM(CASE WHEN delta_duracao_seg > %s THEN 1 ELSE 0 END) AS qtd_acima_tolerancia
+            FROM conferencia_resultados
+            WHERE id_importacao_detraf = %s
+            """,
+            (TOLERANCIA_DURACAO_SEG, id_importacao),
+        )
+        duracao_metricas = cursor.fetchone() or {}
+        seg_total = int(duracao_metricas.get("seg_total") or 0)
+        seg_validos = int(duracao_metricas.get("seg_validos") or 0)
+        seg_invalidos = max(0, seg_total - seg_validos)
+        dashboard_metricas.update(
+            {
+            "segundos_totais": seg_total,
+            "segundos_validos": seg_validos,
+            "segundos_invalidos": seg_invalidos,
+            "chamadas_delta_acima_tolerancia": int(duracao_metricas.get("qtd_acima_tolerancia") or 0),
+            }
+        )
+
+        cursor.execute(
+            """
+            SELECT detalhes_divergencia, snapshot_cdr
+            FROM conferencia_resultados
+            WHERE id_importacao_detraf = %s
+              AND detalhes_divergencia IS NOT NULL
+              AND detalhes_divergencia <> ''
+            """,
+            (id_importacao,),
+        )
+        eot_divergente = 0
+        gh_divergente = 0
+        mult_divergencias = 0
+        divergencias_por_tipo: Counter[str] = Counter()
+        for linha in cursor.fetchall():
+            disposition = _obter_disposition_cdr(linha.get("snapshot_cdr"))
+            _, tipos_validos, possui_eot = _filtrar_detalhes_divergencia(linha.get("detalhes_divergencia"), disposition)
+            if not tipos_validos:
+                continue
+            if len(tipos_validos) > 1:
+                mult_divergencias += 1
+            tipo_inconsistente = {tipo.lower() for tipo in tipos_validos}
+            if "gh" in tipo_inconsistente:
+                gh_divergente += 1
+            for tipo in tipos_validos:
+                tipo_norm = tipo.strip() or "outros"
+                divergencias_por_tipo[tipo_norm] += 1
+            if possui_eot:
+                eot_divergente += 1
+        dashboard_metricas["chamadas_eot_divergente"] = eot_divergente
+        dashboard_metricas["chamadas_gh_divergente"] = gh_divergente
+        dashboard_metricas["chamadas_multiplas_divergencias"] = mult_divergencias
+        dashboard_metricas["divergencias_por_tipo"] = [
+            {"tipo": tipo, "quantidade": quantidade}
+            for tipo, quantidade in divergencias_por_tipo.most_common(8)
+        ]
+
+        cond_cng = "(UPPER(COALESCE(poi,'')) = 'CNG' OR assinante_b_norm LIKE '0800%%' OR assinante_b_norm LIKE '800%%')"
+        cond_dest_movel = "(CHAR_LENGTH(assinante_b_norm) = 11 AND SUBSTRING(assinante_b_norm,3,1) = '9')"
+        cond_dest_fixo = "(CHAR_LENGTH(assinante_b_norm) >= 10 AND SUBSTRING(assinante_b_norm,3,1) IN ('2','3','4','5'))"
+        cursor.execute(
+            f"""
+            SELECT
+                COUNT(1) AS total_chamadas,
+                SUM(duracao_segundos) AS seg_total,
+                SUM(CASE WHEN {cond_cng} THEN 1 ELSE 0 END) AS chamadas_cng,
+                SUM(CASE WHEN {cond_cng} THEN duracao_segundos ELSE 0 END) AS seg_cng,
+                SUM(CASE WHEN {cond_cng} AND UPPER(COALESCE(tarifa_aplicada,'')) = 'VU-M' THEN 1 ELSE 0 END) AS chamadas_cng_movel,
+                SUM(CASE WHEN {cond_cng} AND UPPER(COALESCE(tarifa_aplicada,'')) = 'VU-M' THEN duracao_segundos ELSE 0 END) AS seg_cng_movel,
+                SUM(CASE WHEN {cond_cng} AND UPPER(COALESCE(tarifa_aplicada,'')) = 'TU-RL' THEN 1 ELSE 0 END) AS chamadas_cng_fixo,
+                SUM(CASE WHEN {cond_cng} AND UPPER(COALESCE(tarifa_aplicada,'')) = 'TU-RL' THEN duracao_segundos ELSE 0 END) AS seg_cng_fixo,
+                SUM(CASE WHEN UPPER(COALESCE(tarifa_aplicada,'')) = 'VU-M' THEN 1 ELSE 0 END) AS chamadas_moveis,
+                SUM(CASE WHEN UPPER(COALESCE(tarifa_aplicada,'')) = 'VU-M' THEN duracao_segundos ELSE 0 END) AS seg_moveis,
+                SUM(CASE WHEN UPPER(COALESCE(tarifa_aplicada,'')) = 'TU-RL' THEN 1 ELSE 0 END) AS chamadas_fixas,
+                SUM(CASE WHEN UPPER(COALESCE(tarifa_aplicada,'')) = 'TU-RL' THEN duracao_segundos ELSE 0 END) AS seg_fixas,
+                SUM(
+                    CASE
+                        WHEN UPPER(COALESCE(tarifa_aplicada,'')) NOT IN ('VU-M','TU-RL')
+                        THEN 1 ELSE 0 END
+                ) AS chamadas_outros,
+                SUM(
+                    CASE
+                        WHEN UPPER(COALESCE(tarifa_aplicada,'')) NOT IN ('VU-M','TU-RL')
+                        THEN duracao_segundos ELSE 0 END
+                ) AS seg_outros,
+                SUM(CASE WHEN segundos_gh_normal > 0 AND segundos_gh_reduzido > 0 THEN 1 ELSE 0 END) AS chamadas_cruza_gh,
+                SUM(CASE WHEN {cond_dest_movel} THEN 1 ELSE 0 END) AS chamadas_destino_movel,
+                SUM(CASE WHEN {cond_dest_movel} THEN duracao_segundos ELSE 0 END) AS seg_destino_movel,
+                SUM(CASE WHEN {cond_dest_fixo} THEN 1 ELSE 0 END) AS chamadas_destino_fixo,
+                SUM(CASE WHEN {cond_dest_fixo} THEN duracao_segundos ELSE 0 END) AS seg_destino_fixo
+            FROM detraf_normalizado
+            WHERE id_importacao = %s
+            """,
+            (id_importacao,),
+        )
+        detraf_metricas = cursor.fetchone() or {}
+        dashboard_metricas.update(
+            {
+                "detraf": {
+                    "chamadas_totais": int(detraf_metricas.get("total_chamadas") or 0),
+                    "segundos_totais": int(detraf_metricas.get("seg_total") or 0),
+                    "chamadas_moveis": int(detraf_metricas.get("chamadas_moveis") or 0),
+                    "segundos_moveis": int(detraf_metricas.get("seg_moveis") or 0),
+                    "chamadas_fixas": int(detraf_metricas.get("chamadas_fixas") or 0),
+                    "segundos_fixas": int(detraf_metricas.get("seg_fixas") or 0),
+                    "chamadas_cruzaram_gh": int(detraf_metricas.get("chamadas_cruza_gh") or 0),
+                    "chamadas_cng": int(detraf_metricas.get("chamadas_cng") or 0),
+                    "segundos_cng": int(detraf_metricas.get("seg_cng") or 0),
+                    "chamadas_cng_origem_movel": int(detraf_metricas.get("chamadas_cng_movel") or 0),
+                    "segundos_cng_origem_movel": int(detraf_metricas.get("seg_cng_movel") or 0),
+                    "chamadas_cng_origem_fixo": int(detraf_metricas.get("chamadas_cng_fixo") or 0),
+                    "segundos_cng_origem_fixo": int(detraf_metricas.get("seg_cng_fixo") or 0),
+                    "chamadas_outros": int(detraf_metricas.get("chamadas_outros") or 0),
+                    "segundos_outros": int(detraf_metricas.get("seg_outros") or 0),
+                    "chamadas_destino_movel": int(detraf_metricas.get("chamadas_destino_movel") or 0),
+                    "segundos_destino_movel": int(detraf_metricas.get("seg_destino_movel") or 0),
+                    "chamadas_destino_fixo": int(detraf_metricas.get("chamadas_destino_fixo") or 0),
+                    "segundos_destino_fixo": int(detraf_metricas.get("seg_destino_fixo") or 0),
+                }
+            }
+        )
+
+        registrar_log(
+            "conferencia_resumo",
+            id_importacao=id_importacao,
+            processadas=processadas,
+            validas=validas,
+            invalidas=invalidas,
+            sem_cdr=sem_cdr,
+            delta_tolerancia=dashboard_metricas.get("chamadas_delta_acima_tolerancia"),
+            eot_divergente=dashboard_metricas.get("chamadas_eot_divergente"),
+            multiplas=dashboard_metricas.get("chamadas_multiplas_divergencias"),
+        )
+
+        cursor.execute(
+            """
+            SELECT
+                COALESCE(DATE(data_hora), DATE(criado_em)) AS dia,
+                SUM(CASE WHEN status = 'CONFERIDO' THEN 1 ELSE 0 END) AS conferidos,
+                SUM(CASE WHEN status = 'DIVERGENTE' THEN 1 ELSE 0 END) AS divergentes,
+                SUM(CASE WHEN status = 'PERDIDO' THEN 1 ELSE 0 END) AS perdidos
+            FROM conferencia_resultados
+            WHERE id_importacao_detraf = %s
+            GROUP BY dia
+            ORDER BY dia ASC
+            """,
+            (id_importacao,),
+        )
+        timeline_status = []
+        for linha in cursor.fetchall() or []:
+            dia = linha.get("dia")
+            if hasattr(dia, "isoformat"):
+                dia = dia.isoformat()
+            timeline_status.append(
+                {
+                    "data": dia,
+                    "conferidos": int(linha.get("conferidos") or 0),
+                    "divergentes": int(linha.get("divergentes") or 0),
+                    "perdidos": int(linha.get("perdidos") or 0),
+                }
+            )
+
+        cursor.execute(
+            f"""
+            SELECT
+                COALESCE(DATE(data_hora), data_referencia) AS dia,
+                SUM(CASE WHEN {cond_cng} THEN 1 ELSE 0 END) AS cng,
+                SUM(CASE WHEN UPPER(COALESCE(tarifa_aplicada,'')) = 'VU-M' THEN 1 ELSE 0 END) AS movel,
+                SUM(CASE WHEN UPPER(COALESCE(tarifa_aplicada,'')) = 'TU-RL' THEN 1 ELSE 0 END) AS fixo
+            FROM detraf_normalizado
+            WHERE id_importacao = %s
+            GROUP BY dia
+            ORDER BY dia ASC
+            """,
+            (id_importacao,),
+        )
+        timeline_tarifas = []
+        for linha in cursor.fetchall() or []:
+            dia = linha.get("dia")
+            if hasattr(dia, "isoformat"):
+                dia = dia.isoformat()
+            timeline_tarifas.append(
+                {
+                    "data": dia,
+                    "movel": int(linha.get("movel") or 0),
+                    "fixo": int(linha.get("fixo") or 0),
+                    "cng": int(linha.get("cng") or 0),
+                }
+            )
 
         return {
             "importacao": {
@@ -1143,6 +1678,11 @@ def obter_conferencia_resumo(id_importacao: int):
                 "gh": ghs,
             },
             "gh_metricas": gh_metricas,
+            "dashboard": dashboard_metricas,
+            "timeline": {
+                "status": timeline_status,
+                "tarifas": timeline_tarifas,
+            },
         }
     finally:
         conexao.close()
@@ -1159,12 +1699,23 @@ def listar_conferencia_resultados(
     gh: Optional[str] = None,
     apenas_sem_cdr: bool = False,
     diferenca_min: Optional[int] = Query(None, alias="diferenca_min"),
+    eot_divergente: bool = False,
+    cruza_gh: bool = False,
+    tarifa: Optional[str] = Query(None),
+    assinante_a: Optional[str] = Query(None, alias="assinante_a"),
+    assinante_b: Optional[str] = Query(None, alias="assinante_b"),
+    data_inicio: Optional[str] = Query(None, alias="data_inicio"),
+    data_fim: Optional[str] = Query(None, alias="data_fim"),
+    multi_divergencias: bool = False,
+    gh_inconsistente: bool = False,
+    sigame: bool = False,
 ):
     pagina = max(1, pagina)
     limite = max(1, min(limite, 200))
     offset = (pagina - 1) * limite
+    limite_base = limite
 
-    where, parametros = _montar_filtros_conferencia(
+    where, where_alias, parametros = _montar_filtros_conferencia(
         id_importacao,
         status,
         busca,
@@ -1172,12 +1723,56 @@ def listar_conferencia_resultados(
         gh,
         apenas_sem_cdr,
         diferenca_min,
+        eot_divergente,
+        cruza_gh,
+        tarifa,
+        assinante_a,
+        assinante_b,
+        data_inicio,
+        data_fim,
+        multi_divergencias,
+        gh_inconsistente,
+        sigame,
     )
-    total, registros = _consultar_conferencia_resultados(where, parametros, limite, offset)
+    requer_pos_filtragem = multi_divergencias or eot_divergente
+    consulta_limite = None if requer_pos_filtragem else limite
+    consulta_offset = 0 if requer_pos_filtragem else offset
+    total, registros = _consultar_conferencia_resultados(where, where_alias, parametros, consulta_limite, consulta_offset)
+    total_base = total
+    filtros_aplicados = {
+        "status": status,
+        "descritor": descritor,
+        "gh": gh,
+        "apenas_sem_cdr": apenas_sem_cdr,
+        "diferenca_min": diferenca_min,
+        "eot_divergente": eot_divergente,
+        "cruza_gh": cruza_gh,
+        "tarifa": tarifa,
+        "assinante_a": assinante_a,
+        "assinante_b": assinante_b,
+        "data_inicio": data_inicio,
+        "data_fim": data_fim,
+        "multi_divergencias": multi_divergencias,
+        "gh_inconsistente": gh_inconsistente,
+        "sigame": sigame,
+    }
+    registrar_log(
+        "listar_resultados_base",
+        id_importacao=id_importacao,
+        pagina=pagina,
+        limite=limite_base,
+        total_base=total_base,
+        filtros=filtros_aplicados,
+    )
 
     itens = []
     for linha in registros:
         data_fmt, hora_fmt = _formatar_data_display(linha.get("data_hora"))
+        disposition = _obter_disposition_cdr(linha.get("snapshot_cdr"))
+        detalhes_filtrados, divergencias_resumidas, possui_eot = _filtrar_detalhes_divergencia(
+            linha.get("detalhes_divergencia"), disposition
+        )
+        qtd_divergencias = len(divergencias_resumidas)
         itens.append(
             {
                 "id": linha["id"],
@@ -1186,6 +1781,8 @@ def listar_conferencia_resultados(
                 "descricao_divergencia": linha.get("descricao_divergencia"),
                 "assinante_a": linha.get("assinante_a"),
                 "assinante_b": linha.get("assinante_b"),
+                "tem_sigame": bool(linha.get("flag_sigame")),
+                "assinante_sigame": linha.get("assinante_b_sigame_norm"),
                 "descritor": linha.get("descritor"),
                 "gh": linha.get("gh"),
                 "data": data_fmt,
@@ -1199,13 +1796,39 @@ def listar_conferencia_resultados(
                 "delta_duracao_seg": linha.get("delta_duracao_seg"),
                 "delta_hora_seg": linha.get("delta_hora_seg"),
                 "tem_cdr": bool(linha.get("id_registro_cdr")),
+                "divergencias": divergencias_resumidas,
+                "qtd_divergencias": qtd_divergencias,
+                "tem_multiplas_divergencias": qtd_divergencias > 1,
+                "tem_divergencia_eot": possui_eot,
             }
         )
+
+    if eot_divergente or multi_divergencias:
+        itens_filtrados = itens
+        if eot_divergente:
+            itens_filtrados = [item for item in itens_filtrados if item["tem_divergencia_eot"]]
+        if multi_divergencias:
+            itens_filtrados = [item for item in itens_filtrados if item["tem_multiplas_divergencias"]]
+        total = len(itens_filtrados)
+        inicio = (pagina - 1) * limite_base
+        fim = inicio + limite_base
+        itens = itens_filtrados[inicio:fim]
+
+    registrar_log(
+        "listar_resultados_resposta",
+        id_importacao=id_importacao,
+        pagina=pagina,
+        limite=limite_base,
+        total_base=total_base,
+        total_final=total,
+        aplicou_eot=eot_divergente,
+        aplicou_multi=multi_divergencias,
+    )
 
     return {
         "total": total,
         "pagina": pagina,
-        "por_pagina": limite,
+        "por_pagina": limite_base,
         "resultados": itens,
     }
 
@@ -1232,15 +1855,22 @@ def obter_conferencia_resultado(resultado_id: int):
         registro = cursor.fetchone()
         if not registro:
             raise HTTPException(status_code=404, detail="Resultado não encontrado.")
-        detalhes = registro.pop("detalhes_divergencia", None)
-        registro["detalhes_divergencia"] = []
-        if detalhes:
-            try:
-                registro["detalhes_divergencia"] = json.loads(detalhes)
-            except (json.JSONDecodeError, TypeError):
-                registro["detalhes_divergencia"] = []
+        detalhes_raw = registro.pop("detalhes_divergencia", None)
         detraf = _carregar_snapshot(registro.pop("snapshot_detraf", None))
         cdr = _carregar_snapshot(registro.pop("snapshot_cdr", None))
+        if detraf.get("partes_gh_origem"):
+            partes = detraf["partes_gh_origem"]
+            if isinstance(partes, str):
+                try:
+                    partes = json.loads(partes)
+                except (json.JSONDecodeError, TypeError):
+                    partes = []
+            if isinstance(partes, list):
+                _preencher_partes_detraf(partes)
+                detraf["partes_gh_origem"] = partes
+        disposition = _obter_disposition_cdr(cdr)
+        detalhes_filtrados, _, _ = _filtrar_detalhes_divergencia(detalhes_raw, disposition)
+        registro["detalhes_divergencia"] = detalhes_filtrados
         registro["detraf"] = detraf
         registro["cdr"] = cdr
         if not registro["detalhes_divergencia"] and (registro.get("observacao") or registro.get("descricao_divergencia")):
@@ -1286,6 +1916,15 @@ def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
     exec_id = registrar_execucao_conferencia(id_cliente, detraf["id"], cdr["id"])
     callback = _callback_execucao(exec_id)
 
+    registrar_log(
+        "processar_conferencia_inicio",
+        execucao=exec_id,
+        id_cliente=id_cliente,
+        id_importacao_detraf=detraf["id"],
+        id_importacao_cdr=cdr["id"],
+        forcar_normalizacao=entrada.forcar_normalizacao,
+    )
+
     def _rodar_conferencia():
         try:
             resumo = executar_batimento(
@@ -1295,13 +1934,24 @@ def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
                 periodo_inicio=periodo_inicio,
                 periodo_fim=periodo_fim,
                 notificar_execucao=callback,
+                forcar_normalizacao=entrada.forcar_normalizacao,
             )
+            detalhe_normalizacao = " com normalização refeita" if entrada.forcar_normalizacao else ""
             atualizar_controle_importacao(
                 detraf["id"],
                 mensagem=(
-                    f"Conferência manual executada com CDR {cdr['nome_arquivo']} (Conferidos: {resumo.get('conferidos', 0)}, "
-                    f"Divergentes: {resumo.get('divergentes', 0)}, Perdidos: {resumo.get('perdidos', 0)})."
+                    f"Conferência manual executada{detalhe_normalizacao} com CDR {cdr['nome_arquivo']} "
+                    f"(Conferidos: {resumo.get('conferidos', 0)}, Divergentes: {resumo.get('divergentes', 0)}, "
+                    f"Perdidos: {resumo.get('perdidos', 0)})."
                 ),
+            )
+            registrar_log(
+                "processar_conferencia_concluida",
+                execucao=exec_id,
+                id_importacao_detraf=detraf["id"],
+                id_importacao_cdr=cdr["id"],
+                forcar_normalizacao=entrada.forcar_normalizacao,
+                resumo=resumo,
             )
         except Exception as exc:
             atualizar_execucao_conferencia(
@@ -1309,6 +1959,14 @@ def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
                 status_execucao="ERRO",
                 mensagem=str(exc),
                 erro_resumido=str(exc),
+            )
+            registrar_log(
+                "processar_conferencia_erro",
+                execucao=exec_id,
+                id_importacao_detraf=detraf["id"],
+                id_importacao_cdr=cdr["id"],
+                forcar_normalizacao=entrada.forcar_normalizacao,
+                erro=str(exc),
             )
 
     threading.Thread(target=_rodar_conferencia, daemon=True).start()
@@ -1337,8 +1995,18 @@ def exportar_conferencia_resultados(
     gh: Optional[str] = None,
     apenas_sem_cdr: bool = False,
     diferenca_min: Optional[int] = Query(None, alias="diferenca_min"),
+    eot_divergente: bool = False,
+    cruza_gh: bool = False,
+    tarifa: Optional[str] = Query(None),
+    assinante_a: Optional[str] = Query(None, alias="assinante_a"),
+    assinante_b: Optional[str] = Query(None, alias="assinante_b"),
+    data_inicio: Optional[str] = Query(None, alias="data_inicio"),
+    data_fim: Optional[str] = Query(None, alias="data_fim"),
+    multi_divergencias: bool = False,
+    gh_inconsistente: bool = False,
+    sigame: bool = False,
 ):
-    where, parametros = _montar_filtros_conferencia(
+    where, where_alias, parametros = _montar_filtros_conferencia(
         id_importacao,
         status,
         busca,
@@ -1346,8 +2014,61 @@ def exportar_conferencia_resultados(
         gh,
         apenas_sem_cdr,
         diferenca_min,
+        eot_divergente,
+        cruza_gh,
+        tarifa,
+        assinante_a,
+        assinante_b,
+        data_inicio,
+        data_fim,
+        multi_divergencias,
+        gh_inconsistente,
+        sigame,
     )
-    total, registros = _consultar_conferencia_resultados(where, parametros, limite=None)
+    total, registros = _consultar_conferencia_resultados(where, where_alias, parametros, limite=None)
+
+    if eot_divergente or multi_divergencias:
+        registros_filtrados = registros
+        if eot_divergente:
+            registros_filtrados = [
+                linha
+                for linha in registros_filtrados
+                if _filtrar_detalhes_divergencia(
+                    linha.get("detalhes_divergencia"), _obter_disposition_cdr(linha.get("snapshot_cdr"))
+                )[2]
+            ]
+        if multi_divergencias:
+            registros_filtrados = [
+                linha
+                for linha in registros_filtrados
+                if len(
+                    _filtrar_detalhes_divergencia(
+                        linha.get("detalhes_divergencia"), _obter_disposition_cdr(linha.get("snapshot_cdr"))
+                    )[1]
+                )
+                > 1
+            ]
+        registros = registros_filtrados
+        total = len(registros)
+
+    filtros_export = {
+        "status": status,
+        "descritor": descritor,
+        "gh": gh,
+        "apenas_sem_cdr": apenas_sem_cdr,
+        "diferenca_min": diferenca_min,
+        "eot_divergente": eot_divergente,
+        "cruza_gh": cruza_gh,
+        "tarifa": tarifa,
+        "assinante_a": assinante_a,
+        "assinante_b": assinante_b,
+        "data_inicio": data_inicio,
+        "data_fim": data_fim,
+        "multi_divergencias": multi_divergencias,
+        "gh_inconsistente": gh_inconsistente,
+        "sigame": sigame,
+    }
+    registrar_log("exportar_resultados", id_importacao=id_importacao, total=total, filtros=filtros_export)
 
     cabecalho = [
         "Status",
@@ -1360,8 +2081,15 @@ def exportar_conferencia_resultados(
         "Duração DETRAF",
         "Duração CDR",
         "Delta duração (s)",
+        "Qtd divergências",
+        "Tipos de divergência",
         "Observação",
     ]
+
+    def _tipos_divergencia_csv(linha: dict) -> List[str]:
+        disposition = _obter_disposition_cdr(linha.get("snapshot_cdr"))
+        _, tipos_validos, _ = _filtrar_detalhes_divergencia(linha.get("detalhes_divergencia"), disposition)
+        return tipos_validos
 
     def gerar():
         buffer = io.StringIO()
@@ -1372,6 +2100,7 @@ def exportar_conferencia_resultados(
         buffer.truncate(0)
         for linha in registros:
             data_fmt, hora_fmt = _formatar_data_display(linha.get("data_hora"))
+            tipos_validos = _tipos_divergencia_csv(linha)
             writer.writerow(
                 [
                     linha.get("status"),
@@ -1384,6 +2113,8 @@ def exportar_conferencia_resultados(
                     _formatar_segundos(linha.get("duracao_detraf_seg")),
                     _formatar_segundos(linha.get("duracao_cdr_seg")),
                     linha.get("delta_duracao_seg"),
+                    len(tipos_validos),
+                    ", ".join(tipos_validos),
                     linha.get("observacao"),
                 ]
             )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import logging
+import mysql.connector as mysql
 from collections import defaultdict
 from datetime import datetime, date
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -17,11 +19,13 @@ PRIORIDADE_MOTIVOS = {
     "tempo": 0,
     "status": 1,
     "gh": 2,
+    "gh_cruzado": 2,
     "duracao": 3,
     "eot": 4,
     "descritor": 5,
     "informativo": 6,
 }
+TIPOS_INFORMATIVOS = {"informativo", "gh_cruzado"}
 STATUS_ATENDIDO = {"ANSWERED"}
 STATUS_DESCRICOES = {
     "ANSWERED": "Atendida",
@@ -29,6 +33,8 @@ STATUS_DESCRICOES = {
     "BUSY": "Ocupada",
     "FAILED": "Falha",
 }
+
+LOG = logging.getLogger("api_conferencia")
 
 
 def _delta_tempo(a: Optional[datetime], b: Optional[datetime]) -> Optional[int]:
@@ -166,19 +172,31 @@ def avaliar_divergencias(
     gh_operadora = (detraf.get("gh") or "").strip().upper()
     segundos_normais = int(detraf.get("segundos_gh_normal") or 0)
     segundos_reduzidos = int(detraf.get("segundos_gh_reduzido") or 0)
-    if gh_operadora == "N" and segundos_reduzidos > 0:
+    cruzou_gh = segundos_normais > 0 and segundos_reduzidos > 0
+    if cruzou_gh:
+        minutos_normais = round(segundos_normais / 60, 2)
+        minutos_reduzidos = round(segundos_reduzidos / 60, 2)
+        gh_info = gh_operadora or "não informado"
+        motivos.append(
+            _motivo(
+                "gh_cruzado",
+                f"Chamada cruzou grupo horário: {minutos_normais} min normal + {minutos_reduzidos} min reduzido (GH DETRAF = {gh_info}).",
+            )
+        )
+    if gh_operadora == "N" and segundos_reduzidos > 0 and not cruzou_gh:
         minutos = round(segundos_reduzidos / 60, 2)
         motivos.append(
             _motivo("gh", f"Chamada cruza período reduzido ({minutos} min) mas GH informado = N.")
         )
-    if gh_operadora == "R" and segundos_normais > 0:
+    if gh_operadora == "R" and segundos_normais > 0 and not cruzou_gh:
         minutos = round(segundos_normais / 60, 2)
         motivos.append(
             _motivo("gh", f"Chamada com {minutos} min em horário normal, porém GH informado = R.")
         )
 
     motivos.sort(key=lambda item: item["prioridade"])
-    if motivos:
+    possui_divergencia = any(item["tipo"] not in TIPOS_INFORMATIVOS for item in motivos)
+    if possui_divergencia:
         return "DIVERGENTE", motivos
     return "CONFERIDO", motivos
 
@@ -213,7 +231,17 @@ def _persistir(id_importacao_detraf: int, linhas: Sequence[Tuple]) -> None:
                 )
                 """
             )
-            cursor.executemany(sql, linhas)
+            try:
+                cursor.executemany(sql, linhas)
+            except mysql.Error as exc:
+                exemplo = linhas[0] if linhas else ()
+                LOG.error(
+                    "sql_persistir_conferencia | erro=%s | placeholders=%s | exemplo=%s",
+                    exc,
+                    sql.count("%s"),
+                    exemplo,
+                )
+                raise
         conexao.commit()
     finally:
         cursor.close()
@@ -227,6 +255,7 @@ def executar_batimento(
     periodo_inicio: Optional[date] = None,
     periodo_fim: Optional[date] = None,
     notificar_execucao: Optional[Callable[[str, str, int, int, int, Optional[str]], None]] = None,
+    forcar_normalizacao: bool = False,
 ) -> Dict[str, int]:
     def atualizar(status: str, etapa: str, progresso: int, processados: int, total: int, mensagem: Optional[str] = None):
         if not notificar_execucao:
@@ -247,6 +276,7 @@ def executar_batimento(
                 total,
                 None,
             ),
+            forcar_reprocessamento=forcar_normalizacao,
         )
 
         if id_importacao_cdr:
@@ -264,6 +294,7 @@ def executar_batimento(
                     total,
                     None,
                 ),
+                forcar_reprocessamento=forcar_normalizacao,
             )
         else:
             cdr_norm = []

@@ -253,10 +253,30 @@ def criar_tabela_detraf_normalizado():
         if not existe or not existe[0]:
             cursor.execute(ddl)
 
-    _garantir_coluna("tarifa_aplicada", "ALTER TABLE detraf_normalizado ADD COLUMN tarifa_aplicada VARCHAR(10) NULL AFTER poi")
-    _garantir_coluna("segundos_gh_normal", "ALTER TABLE detraf_normalizado ADD COLUMN segundos_gh_normal INT DEFAULT 0 AFTER tarifa_aplicada")
-    _garantir_coluna("segundos_gh_reduzido", "ALTER TABLE detraf_normalizado ADD COLUMN segundos_gh_reduzido INT DEFAULT 0 AFTER segundos_gh_normal")
-    _garantir_coluna("detalhes_gh", "ALTER TABLE detraf_normalizado ADD COLUMN detalhes_gh LONGTEXT NULL AFTER segundos_gh_reduzido")
+    _garantir_coluna(
+        "tarifa_aplicada",
+        "ALTER TABLE detraf_normalizado ADD COLUMN tarifa_aplicada VARCHAR(10) NULL AFTER poi",
+    )
+    _garantir_coluna(
+        "segundos_gh_normal",
+        "ALTER TABLE detraf_normalizado ADD COLUMN segundos_gh_normal INT DEFAULT 0 AFTER tarifa_aplicada",
+    )
+    _garantir_coluna(
+        "segundos_gh_reduzido",
+        "ALTER TABLE detraf_normalizado ADD COLUMN segundos_gh_reduzido INT DEFAULT 0 AFTER segundos_gh_normal",
+    )
+    _garantir_coluna(
+        "detalhes_gh",
+        "ALTER TABLE detraf_normalizado ADD COLUMN detalhes_gh LONGTEXT NULL AFTER segundos_gh_reduzido",
+    )
+    _garantir_coluna(
+        "assinante_b_sigame_norm",
+        "ALTER TABLE detraf_normalizado ADD COLUMN assinante_b_sigame_norm VARCHAR(32) NULL AFTER assinante_b_norm",
+    )
+    _garantir_coluna(
+        "flag_sigame",
+        "ALTER TABLE detraf_normalizado ADD COLUMN flag_sigame TINYINT(1) DEFAULT 0 AFTER assinante_b_sigame_norm",
+    )
     conexao.commit()
     cursor.close()
     conexao.close()

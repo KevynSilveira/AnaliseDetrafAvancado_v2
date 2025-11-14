@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time as systime
 from datetime import datetime, date, time as dt_time, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import mysql.connector as mysql
@@ -15,6 +18,28 @@ from .gh import calcular_segmentos_gh
 TELEFONE_RGX = re.compile(r"\D")
 DDD_VALIDO = {f"{i:02d}" for i in range(11, 100)}
 TOLL_PREFIXOS = ("0800", "0300", "0500", "0900")
+LOG = logging.getLogger("api_conferencia")
+SIGAME_LOG = logging.getLogger("sigame_normalizacao")
+if not SIGAME_LOG.handlers:
+    base_dir = Path(__file__).resolve().parents[2]
+    log_dir = base_dir / "var" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(log_dir / "sigame_normalizacao.log", maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    SIGAME_LOG.addHandler(handler)
+SIGAME_LOG.setLevel(logging.INFO)
+
+
+def _registrar_sigame_evento(evento: str, **contexto):
+    if not SIGAME_LOG.handlers:
+        return
+    try:
+        payload = json.dumps(contexto, ensure_ascii=False, default=str)
+    except Exception as exc:
+        LOG.warning("Falha ao serializar log de siga-me (%s): %s", evento, exc)
+        payload = str(contexto)
+    SIGAME_LOG.info("%s | %s", evento, payload)
 
 
 def _eh_destino_cng(destino_raw: Optional[str], destino_norm: Optional[str]) -> bool:
@@ -75,6 +100,10 @@ def _normalizar_telefone(valor: Optional[str], ddd_base: Optional[str] = None) -
 
     if len(digitos) > 13:
         digitos = digitos[-11:]
+    elif len(digitos) > 11:
+        # depois de remover DDI/CSP ainda podem restar números com 12 ou 13 dígitos;
+        # nesses casos mantemos os 11 últimos dígitos (DDD + número) para evitar falhas de normalização
+        digitos = digitos[-11:]
 
     if len(digitos) == 9 and digitos[0] == "9" and ddd_base:
         digitos = ddd_base + digitos
@@ -109,6 +138,50 @@ def _tipo_numero(valor: Optional[str]) -> Optional[str]:
     if codigo_inicial in {"2", "3", "4", "5"}:
         return "FIXO"
     return None
+
+
+def _bloco_eh_telefone(bloco: str) -> bool:
+    if len(bloco) not in (10, 11):
+        return False
+    ddd = bloco[:2]
+    if ddd not in DDD_VALIDO:
+        return False
+    if not bloco[2:].isdigit():
+        return False
+    return True
+
+
+def _extrair_destino_sigame(valor: Optional[str], retornar_motivo: bool = False):
+    """Extrai o destino real informado após o segundo '@' do campo siga-me."""
+
+    def _retorno(destino: Optional[str], motivo: Optional[str]):
+        return (destino, motivo) if retornar_motivo else destino
+
+    if not valor:
+        return _retorno(None, "sigame_vazio")
+    texto = str(valor).strip()
+    if not texto:
+        return _retorno(None, "sigame_branco")
+    partes = texto.split("@", 2)
+    if len(partes) < 3:
+        return _retorno(None, "sigame_incompleto")
+    origem_segmento, _, destino_bruto = partes
+    origem_digitos = TELEFONE_RGX.sub("", origem_segmento or "")
+    destino_digitos = TELEFONE_RGX.sub("", destino_bruto)
+    if not destino_digitos:
+        return _retorno(None, "destino_sigame_vazio")
+    if len(destino_digitos) > 11:
+        destino_digitos = destino_digitos[-11:]
+    if destino_digitos == origem_digitos:
+        return _retorno(None, "destino_igual_origem")
+    if len(destino_digitos) in (10, 11):
+        ddd = destino_digitos[:2]
+        if ddd in DDD_VALIDO:
+            return _retorno(destino_digitos, "destino_completo")
+        return _retorno(None, "ddd_invalido")
+    if len(destino_digitos) in (8, 9):
+        return _retorno(destino_digitos, "destino_sem_ddd")
+    return _retorno(None, "tamanho_invalido")
 
 
 def _definir_tarifa(destino_raw: Optional[str], destino_norm: Optional[str], origem_norm: Optional[str]) -> Optional[str]:
@@ -316,6 +389,15 @@ def _mesclar_registros_por_gh(registros: Sequence[Dict]) -> Dict:
                 "gh": (item.get("gh") or "").strip() or None,
                 "duracao_real_segundos": dur_real,
                 "duracao_calculada_seg": dur_calc_seg,
+                "data_chamada": str(item.get("data_chamada") or ""),
+                "hora_atendimento": str(item.get("hora_atendimento") or ""),
+                "assinante_a": item.get("assinante_a"),
+                "assinante_b": item.get("assinante_b"),
+                "poi": item.get("poi"),
+                "eqt_credora": item.get("eqt_credora"),
+                "eqt_devedora": item.get("eqt_devedora"),
+                "valor_remuneracao": item.get("valor_remuneracao"),
+                "descritor_cdr": item.get("descritor_cdr"),
             }
         )
         total_real += dur_real
@@ -362,8 +444,36 @@ def _json_dump(payload: Dict) -> str:
     return json.dumps(payload, default=str, ensure_ascii=False)
 
 
-def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: Optional[Callable[[int, int], None]] = None) -> List[Dict]:
-    existentes = _carregar_detraf_normalizado_existente(id_cliente, id_importacao)
+def _registrar_sql_lote(evento: str, sql: str, lote: List[Tuple], erro: Exception):
+    exemplo = lote[0] if lote else ()
+    LOG.error(
+        "%s | erro=%s | placeholders=%s | exemplo=%s",
+        evento,
+        erro,
+        sql.count("%s"),
+        exemplo,
+    )
+
+
+def _executar_lote(cursor, conexao, sql: str, lote: List[Tuple], evento: str):
+    try:
+        cursor.executemany(sql, lote)
+        conexao.commit()
+    except mysql.Error as exc:
+        conexao.rollback()
+        _registrar_sql_lote(evento, sql, lote, exc)
+        raise
+
+
+def normalizar_detraf(
+    id_cliente: int,
+    id_importacao: int,
+    notificar_progresso: Optional[Callable[[int, int], None]] = None,
+    forcar_reprocessamento: bool = False,
+) -> List[Dict]:
+    existentes: List[Dict] = []
+    if not forcar_reprocessamento:
+        existentes = _carregar_detraf_normalizado_existente(id_cliente, id_importacao)
     if existentes:
         if notificar_progresso:
             total_existentes = len(existentes)
@@ -386,6 +496,7 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                    eqt_devedora, poi
             FROM detraf_operadora_batimento
             WHERE id_importacao=%s
+            ORDER BY data_chamada ASC, hora_atendimento ASC, sequencial ASC, id ASC
             """,
             (id_importacao,),
         )
@@ -398,11 +509,11 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
             INSERT INTO detraf_normalizado (
                 id_cliente, id_importacao, id_registro, sequencial, data_hora, data_referencia,
                 hora_segundos, duracao_segundos, duracao_calculada_seg, assinante_a_norm,
-                assinante_b_norm, descritor, gh, eot_credora, eot_devedora, poi,
-                tarifa_aplicada, segundos_gh_normal, segundos_gh_reduzido, detalhes_gh,
-                chave_batimento, snapshot
+                assinante_b_norm, assinante_b_sigame_norm, flag_sigame, descritor, gh,
+                eot_credora, eot_devedora, poi, tarifa_aplicada, segundos_gh_normal,
+                segundos_gh_reduzido, detalhes_gh, chave_batimento, snapshot
             ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             )
             """
         )
@@ -417,9 +528,16 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
             duracao_calc = _duracao_calculada_para_segundos(registro.get("duracao_calculada"))
             assinante_a = _normalizar_telefone(registro.get("assinante_a"))
             ddd_a = _extrair_ddd(assinante_a)
-            assinante_b = _normalizar_telefone(registro.get("assinante_b"), ddd_base=ddd_a)
+            sigame_raw = registro.get("sigame")
+            sigame_destino_bruto, sigame_motivo = _extrair_destino_sigame(sigame_raw, retornar_motivo=True)
+            destino_base = sigame_destino_bruto or registro.get("assinante_b")
+            assinante_b = _normalizar_telefone(destino_base, ddd_base=ddd_a)
+            sigame_destino_norm = (
+                _normalizar_telefone(sigame_destino_bruto, ddd_base=ddd_a) if sigame_destino_bruto else None
+            )
+            flag_sigame = bool(sigame_destino_norm)
             chave = _gerar_chave(assinante_a, assinante_b, data_hora)
-            tarifa_aplicada = _definir_tarifa(registro.get("assinante_b"), assinante_b, assinante_a)
+            tarifa_aplicada = _definir_tarifa(destino_base, assinante_b, assinante_a)
             tarifa_base = tarifa_aplicada or "TU-RL"
             gh_resultado = calcular_segmentos_gh(data_hora, duracao_segundos, tarifa_base)
             segmentos_gh = [segmento.__dict__ for segmento in gh_resultado.segmentos]
@@ -433,6 +551,25 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                     "segmentos_gh": segmentos_gh,
                 }
             )
+            if sigame_destino_bruto:
+                registro_snapshot["sigame_destino_raw"] = sigame_destino_bruto
+            if sigame_destino_norm:
+                registro_snapshot["sigame_destino_norm"] = sigame_destino_norm
+                registro_snapshot["sigame_aplicado"] = True
+            if sigame_raw:
+                evento_sigame = "sigame_detraf_aplicado" if sigame_destino_norm else "sigame_detraf_ignorado"
+                _registrar_sigame_evento(
+                    evento_sigame,
+                    id_cliente=id_cliente,
+                    id_importacao=id_importacao,
+                    contexto="detraf",
+                    registro_id=registro.get("id"),
+                    sigame=sigame_raw,
+                    destino_raw=sigame_destino_bruto,
+                    destino_norm=sigame_destino_norm,
+                    motivo=sigame_motivo,
+                    data_hora=str(data_hora) if data_hora else None,
+                )
             if registro.get("__gh_unificado"):
                 registro_snapshot["gh_unificado"] = True
                 registro_snapshot["partes_gh_origem"] = registro.get("__gh_partes", [])
@@ -446,6 +583,7 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                 "duracao_calculada": duracao_calc,
                 "assinante_a": assinante_a,
                 "assinante_b": assinante_b,
+                "assinante_b_sigame": sigame_destino_norm,
                 "descritor": registro.get("descritor_cdr"),
                 "gh": registro.get("gh"),
                 "eqt_credora": registro.get("eqt_credora"),
@@ -457,6 +595,7 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                 "segmentos_gh": segmentos_gh,
                 "snapshot": snapshot,
                 "chave": chave,
+                "flag_sigame": flag_sigame,
             }
             normalizados.append(normalizado)
 
@@ -473,6 +612,8 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
                     duracao_calc,
                     assinante_a,
                     assinante_b,
+                    sigame_destino_norm,
+                    1 if flag_sigame else 0,
                     registro.get("descritor_cdr"),
                     registro.get("gh"),
                     registro.get("eqt_credora"),
@@ -488,16 +629,14 @@ def normalizar_detraf(id_cliente: int, id_importacao: int, notificar_progresso: 
             )
 
             if len(lote) >= 500:
-                cursor.executemany(sql_insert, lote)
-                conexao.commit()
+                _executar_lote(cursor, conexao, sql_insert, lote, "sql_normaliza_detraf")
                 lote.clear()
             processados += 1
             if notificar_progresso and processados % 1000 == 0:
                 notificar_progresso(processados, total)
 
         if lote:
-            cursor.executemany(sql_insert, lote)
-            conexao.commit()
+            _executar_lote(cursor, conexao, sql_insert, lote, "sql_normaliza_detraf")
 
         if notificar_progresso:
             notificar_progresso(total, total)
@@ -552,11 +691,14 @@ def normalizar_cdr(
     periodo_inicio: Optional[date] = None,
     periodo_fim: Optional[date] = None,
     notificar_progresso: Optional[Callable[[int, int], None]] = None,
+    forcar_reprocessamento: bool = False,
 ) -> List[Dict]:
     if not id_importacao_cdr:
         return []
 
-    existentes = _carregar_cdr_normalizado_existente(id_cliente, id_importacao_cdr)
+    existentes: List[Dict] = []
+    if not forcar_reprocessamento:
+        existentes = _carregar_cdr_normalizado_existente(id_cliente, id_importacao_cdr)
     if existentes:
         if notificar_progresso:
             total_existentes = len(existentes)
@@ -616,6 +758,15 @@ def normalizar_cdr(
             if condicoes:
                 sql += " WHERE " + " AND ".join(condicoes)
 
+        sql += " ORDER BY " + ", ".join(
+            [
+                f"`{mapa['calldate']}`",
+                f"`{mapa['src']}`",
+                f"`{mapa['dst']}`",
+                f"`{mapa['id']}`",
+            ]
+        )
+
         cursor_cli.execute(sql, tuple(parametros))
         registros = cursor_cli.fetchall()
     finally:
@@ -670,7 +821,14 @@ def normalizar_cdr(
             duracao = int(registro.get("billsec") or 0)
             caller = _normalizar_telefone(registro.get("src"))
             ddd_caller = _extrair_ddd(caller)
-            callee = _normalizar_telefone(registro.get("dst"), ddd_base=ddd_caller)
+            sigame_raw = registro.get("sigame")
+            sigame_destino_bruto, sigame_motivo = _extrair_destino_sigame(sigame_raw, retornar_motivo=True)
+            dst_original = registro.get("dst")
+            if sigame_destino_bruto:
+                registro["dst_original"] = dst_original
+                registro["dst"] = sigame_destino_bruto
+            destino_base = sigame_destino_bruto or dst_original
+            callee = _normalizar_telefone(destino_base, ddd_base=ddd_caller)
             descritor = registro.get("accountcode") or registro.get("userfield")
             if descritor is not None:
                 descritor = str(descritor)[:MAX_DESCRITOR_CDR]
@@ -687,6 +845,28 @@ def normalizar_cdr(
             sentido = registro.get("sentido")
             if sentido is not None:
                 sentido = str(sentido).strip().upper() or None
+            if sigame_destino_bruto:
+                registro["sigame_destino_raw"] = sigame_destino_bruto
+            if sigame_destino_bruto and callee:
+                registro["sigame_destino_norm"] = callee
+            if sigame_raw:
+                evento_sigame = (
+                    "sigame_cdr_aplicado" if (sigame_destino_bruto and callee) else "sigame_cdr_sem_destino"
+                )
+                _registrar_sigame_evento(
+                    evento_sigame,
+                    id_cliente=id_cliente,
+                    id_importacao=id_importacao_cdr,
+                    contexto="cdr",
+                    registro_id=str(registro_id),
+                    caller=caller,
+                    dst_original=dst_original,
+                    sigame=sigame_raw,
+                    destino_raw=sigame_destino_bruto,
+                    destino_norm=callee,
+                    motivo=sigame_motivo,
+                    data_hora=str(data_hora) if data_hora else None,
+                )
             snapshot = _json_dump(registro)
             chave = _gerar_chave(caller, callee, data_hora)
 
@@ -727,16 +907,14 @@ def normalizar_cdr(
             )
 
             if len(lote) >= 500:
-                cursor.executemany(sql_insert, lote)
-                conexao.commit()
+                _executar_lote(cursor, conexao, sql_insert, lote, "sql_normaliza_cdr")
                 lote.clear()
             processados += 1
             if notificar_progresso and processados % 1000 == 0:
                 notificar_progresso(processados, total)
 
         if lote:
-            cursor.executemany(sql_insert, lote)
-            conexao.commit()
+            _executar_lote(cursor, conexao, sql_insert, lote, "sql_normaliza_cdr")
 
         if notificar_progresso:
             notificar_progresso(total, total)
