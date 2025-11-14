@@ -432,12 +432,9 @@ export default function Configuracoes() {
             <button className="btn-secondary" onClick={limparFormulario} type="button">
               Limpar seleção
             </button>
-            <button className="text-sm text-gray-300 hover:text-primary" onClick={carregarResumo} type="button">
-              Atualizar resumo
-            </button>
           </div>
 
-          {(mensagem || resultadoResumo.length) && (
+          {(Boolean(mensagem) || resultadoResumo.length > 0) && (
             <div className={`rounded-xl border p-4 text-sm space-y-3 ${obterClasseMensagem(mensagem || (resultadoResumo.length ? "informativo" : ""))}`}>
               {mensagem && <div className="font-semibold">{mensagem}</div>}
               {resultadoResumo.length > 0 && (

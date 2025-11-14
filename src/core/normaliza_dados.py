@@ -14,6 +14,7 @@ import mysql.connector as mysql
 from .banco.conexao_banco import obter_conexao
 from .banco.clientes_schema import conexao_banco_cliente, obter_banco_cliente
 from .gh import calcular_segmentos_gh
+from .configuracao_logs import registrar_log
 
 TELEFONE_RGX = re.compile(r"\D")
 DDD_VALIDO = {f"{i:02d}" for i in range(11, 100)}
@@ -471,10 +472,22 @@ def normalizar_detraf(
     notificar_progresso: Optional[Callable[[int, int], None]] = None,
     forcar_reprocessamento: bool = False,
 ) -> List[Dict]:
+    registrar_log(
+        "normalizacao_detraf_inicio",
+        id_cliente=id_cliente,
+        id_importacao=id_importacao,
+        forcar_reprocessamento=forcar_reprocessamento,
+    )
     existentes: List[Dict] = []
     if not forcar_reprocessamento:
         existentes = _carregar_detraf_normalizado_existente(id_cliente, id_importacao)
     if existentes:
+        registrar_log(
+            "normalizacao_detraf_cache",
+            id_cliente=id_cliente,
+            id_importacao=id_importacao,
+            total_registros=len(existentes),
+        )
         if notificar_progresso:
             total_existentes = len(existentes)
             notificar_progresso(total_existentes, total_existentes)
@@ -640,7 +653,21 @@ def normalizar_detraf(
 
         if notificar_progresso:
             notificar_progresso(total, total)
+        registrar_log(
+            "normalizacao_detraf_concluida",
+            id_cliente=id_cliente,
+            id_importacao=id_importacao,
+            total_processados=total,
+        )
         return normalizados
+    except Exception as exc:
+        registrar_log(
+            "normalizacao_detraf_erro",
+            id_cliente=id_cliente,
+            id_importacao=id_importacao,
+            erro=str(exc),
+        )
+        raise
     finally:
         cursor.close()
         conexao.close()
@@ -918,7 +945,21 @@ def normalizar_cdr(
 
         if notificar_progresso:
             notificar_progresso(total, total)
+        registrar_log(
+            "normalizacao_cdr_concluida",
+            id_cliente=id_cliente,
+            id_importacao=id_importacao_cdr,
+            total_processados=total,
+        )
         return normalizados
+    except Exception as exc:
+        registrar_log(
+            "normalizacao_cdr_erro",
+            id_cliente=id_cliente,
+            id_importacao=id_importacao_cdr,
+            erro=str(exc),
+        )
+        raise
     finally:
         cursor.close()
         conexao.close()

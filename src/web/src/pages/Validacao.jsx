@@ -1590,14 +1590,6 @@ const tooltipCursorStyle = { fill: "rgba(255,255,255,0.04)" };
                   <td className="px-4 py-3 align-top">
                     <div className="flex flex-col gap-1">
                       <span>{item.assinante_b || "--"}</span>
-                      {item.tem_sigame && (
-                        <span className="inline-flex w-fit items-center gap-1 rounded-full border border-indigo-400/40 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-200">
-                          <span>Siga-me:</span>
-                          <span className="font-normal normal-case text-indigo-100">
-                            {formatarTelefoneExibicao(item.assinante_sigame || "") || item.assinante_sigame || "--"}
-                          </span>
-                        </span>
-                      )}
                     </div>
                   </td>
                   <td className="px-4 py-3 align-top">{item.descritor || "--"}</td>

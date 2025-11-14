@@ -9,6 +9,7 @@ from typing import Callable, List, Optional, TypedDict
 import mysql.connector as mysql
 
 from src.core.banco.clientes_schema import garantir_banco_cliente, conexao_banco_cliente
+from src.core.configuracao_logs import registrar_log
 
 INSERT_DETRAF_SQL = """
     INSERT INTO detraf_operadora_batimento (
@@ -105,6 +106,13 @@ def processar_arquivo_detraf(
     atualizar_controle: Callable[..., None],
 ) -> ResumoImportacaoDetraf:
     """Processa o arquivo DETRAF e devolve um resumo da importação."""
+    registrar_log(
+        "detraf_importacao_inicio",
+        arquivo=str(caminho),
+        id_importacao=id_importacao,
+        id_cliente=id_cliente,
+        tamanho_bytes=caminho.stat().st_size if caminho.exists() else None,
+    )
     atualizar_controle(
         id_importacao,
         mensagem="Processando arquivo DETRAF. Extraindo dados de batimento...",
@@ -127,6 +135,7 @@ def processar_arquivo_detraf(
     except mysql.Error:
         conexao_cli.rollback()
 
+    linhas_invalidas = 0
     try:
         cursor.execute("DELETE FROM detraf_operadora_batimento WHERE id_importacao=%s", (id_importacao,))
         conexao.commit()
@@ -147,6 +156,7 @@ def processar_arquivo_detraf(
         with open(caminho, "r", encoding="utf-8", errors="ignore") as handle:
             for linha in handle:
                 if len(linha) < 153:
+                    linhas_invalidas += 1
                     continue
 
                 sequencial = linha[0:10].strip()
@@ -258,13 +268,33 @@ def processar_arquivo_detraf(
             linhas_processadas=total,
         )
 
-        return ResumoImportacaoDetraf(
+        resumo = ResumoImportacaoDetraf(
             periodo_inicial=periodo_inicial,
             periodo_final=periodo_final,
             eqt_credora=eqt_credora_val,
             eqt_devedora=eqt_devedora_val,
             linhas_processadas=total,
         )
+        registrar_log(
+            "detraf_importacao_concluida",
+            id_importacao=id_importacao,
+            id_cliente=id_cliente,
+            arquivo=str(caminho),
+            total_registros=total,
+            linhas_invalidas=linhas_invalidas,
+            periodo_inicial=periodo_inicial,
+            periodo_final=periodo_final,
+        )
+        return resumo
+    except Exception as exc:
+        registrar_log(
+            "detraf_importacao_erro",
+            id_importacao=id_importacao,
+            id_cliente=id_cliente,
+            arquivo=str(caminho),
+            erro=str(exc),
+        )
+        raise
     finally:
         try:
             cursor_cli.close()

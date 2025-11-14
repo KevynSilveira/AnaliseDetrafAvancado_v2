@@ -13,8 +13,6 @@ import json
 import os
 import re
 import threading
-import logging
-from logging.handlers import RotatingFileHandler
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -56,6 +54,7 @@ from src.core.limpeza import (
 from src.core.faz_batimento import executar_batimento, TOLERANCIA_DURACAO_SEG
 from src.core.importadores.importador_cdr import importar_dump_cdr
 from src.core.importadores.importador_detraf import processar_arquivo_detraf
+from src.core.configuracao_logs import registrar_log, serializar_para_log
 
 # ======================================
 # Carrega o .env do caminho correto
@@ -88,38 +87,6 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # ======================================
 # Logging centralizado
 # ======================================
-LOG_FILE = LOG_DIR / "api_conferencia.log"
-LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-logger = logging.getLogger("api_conferencia")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=5, encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-
-
-def _serializar_para_log(valor):
-    if isinstance(valor, (datetime, date, time)):
-        return valor.isoformat()
-    if isinstance(valor, (list, tuple)):
-        return [_serializar_para_log(v) for v in valor]
-    if isinstance(valor, dict):
-        return {k: _serializar_para_log(v) for k, v in valor.items()}
-    try:
-        json.dumps(valor)
-        return valor
-    except (TypeError, ValueError):
-        return str(valor)
-
-
-def registrar_log(evento: str, **contexto):
-    dados = {chave: _serializar_para_log(valor) for chave, valor in contexto.items()}
-    try:
-        logger.info("%s | %s", evento, json.dumps(dados, ensure_ascii=False))
-    except Exception as exc:  # pragma: no cover - log de fallback
-        logger.warning("Falha ao registrar log (%s): %s", evento, exc)
 
 
 def _registrar_sql_erro(evento: str, sql: str, parametros, erro: Exception):
@@ -127,7 +94,7 @@ def _registrar_sql_erro(evento: str, sql: str, parametros, erro: Exception):
         evento,
         sql=sql,
         placeholders=sql.count("%s"),
-        parametros=_serializar_para_log(parametros),
+        parametros=serializar_para_log(parametros),
         erro=str(erro),
     )
 
@@ -572,12 +539,13 @@ def _montar_filtros_conferencia(
     if sigame:
         condicoes.append(
             f"""
-            EXISTS (
-                SELECT 1
-                FROM detraf_normalizado dn
-                WHERE dn.id_importacao = {tabela}.id_importacao_detraf
-                  AND dn.id_registro = {tabela}.id_registro_detraf
-                  AND COALESCE(dn.flag_sigame, 0) = 1
+            (
+                COALESCE(JSON_VALID({col('snapshot_cdr')}), 0) = 1
+                AND JSON_EXTRACT({col('snapshot_cdr')}, '$.sigame') IS NOT NULL
+                AND COALESCE(
+                    JSON_UNQUOTE(JSON_EXTRACT({col('snapshot_cdr')}, '$.sigame')),
+                    ''
+                ) <> ''
             )
             """
         )
@@ -687,13 +655,8 @@ def _consultar_conferencia_resultados(
                 conferencia_resultados.delta_duracao_seg,
                 conferencia_resultados.delta_hora_seg,
                 conferencia_resultados.id_registro_detraf,
-                conferencia_resultados.id_registro_cdr,
-                COALESCE(dn.flag_sigame, 0) AS flag_sigame,
-                dn.assinante_b_sigame_norm
+                conferencia_resultados.id_registro_cdr
             FROM conferencia_resultados
-            LEFT JOIN detraf_normalizado dn
-              ON dn.id_importacao = conferencia_resultados.id_importacao_detraf
-             AND dn.id_registro = conferencia_resultados.id_registro_detraf
             WHERE {where}
             ORDER BY FIELD(conferencia_resultados.status,'CONFERIDO','DIVERGENTE','PERDIDO'),
                      conferencia_resultados.data_hora ASC,
@@ -739,6 +702,21 @@ def _obter_disposition_cdr(snapshot_payload) -> str:
         or dados.get("cdr_disposition")
     )
     return str(valor).strip().upper() if valor else ""
+
+
+def _extrair_sigame_snapshot(snapshot_payload) -> Tuple[bool, Optional[str]]:
+    if not snapshot_payload:
+        return False, None
+    dados = snapshot_payload if isinstance(snapshot_payload, dict) else _carregar_snapshot(snapshot_payload)
+    if not isinstance(dados, dict) or not dados:
+        return False, None
+    sigame_bruto = dados.get("sigame")
+    if not sigame_bruto:
+        return False, None
+    destino = dados.get("sigame_destino_norm") or dados.get("sigame_destino_raw")
+    if destino is not None:
+        destino = str(destino).strip() or None
+    return True, destino
 
 
 def _filtrar_detalhes_divergencia(
@@ -1768,7 +1746,9 @@ def listar_conferencia_resultados(
     itens = []
     for linha in registros:
         data_fmt, hora_fmt = _formatar_data_display(linha.get("data_hora"))
-        disposition = _obter_disposition_cdr(linha.get("snapshot_cdr"))
+        snapshot_payload = linha.get("snapshot_cdr")
+        disposition = _obter_disposition_cdr(snapshot_payload)
+        tem_sigame, assinante_sigame = _extrair_sigame_snapshot(snapshot_payload)
         detalhes_filtrados, divergencias_resumidas, possui_eot = _filtrar_detalhes_divergencia(
             linha.get("detalhes_divergencia"), disposition
         )
@@ -1781,8 +1761,8 @@ def listar_conferencia_resultados(
                 "descricao_divergencia": linha.get("descricao_divergencia"),
                 "assinante_a": linha.get("assinante_a"),
                 "assinante_b": linha.get("assinante_b"),
-                "tem_sigame": bool(linha.get("flag_sigame")),
-                "assinante_sigame": linha.get("assinante_b_sigame_norm"),
+                "tem_sigame": tem_sigame,
+                "assinante_sigame": assinante_sigame,
                 "descritor": linha.get("descritor"),
                 "gh": linha.get("gh"),
                 "data": data_fmt,

@@ -9,6 +9,7 @@ from datetime import date
 import mysql.connector as mysql
 
 from src.core.banco.clientes_schema import garantir_banco_cliente, conexao_banco_cliente
+from src.core.configuracao_logs import registrar_log
 
 
 def importar_dump_cdr(
@@ -26,6 +27,13 @@ def importar_dump_cdr(
         raise RuntimeError("Banco de dados não configurado para importação CDR.")
 
     nome_banco_cliente = garantir_banco_cliente(id_cliente)
+    registrar_log(
+        "cdr_importacao_inicio",
+        arquivo=str(caminho_dump),
+        id_cliente=id_cliente,
+        tamanho_bytes=caminho_dump.stat().st_size if caminho_dump.exists() else None,
+        banco=nome_banco_cliente,
+    )
 
     comando = ["mysql"]
     if configuracao_mysql.get("host"):
@@ -49,13 +57,23 @@ def importar_dump_cdr(
 
     comando.extend(["-D", nome_banco_cliente])
 
-    with open(caminho_dump, "rb") as conteudo_dump:
-        subprocess.run(
-            comando,
-            stdin=conteudo_dump,
-            check=True,
-            env=ambiente,
+    try:
+        with open(caminho_dump, "rb") as conteudo_dump:
+            subprocess.run(
+                comando,
+                stdin=conteudo_dump,
+                check=True,
+                env=ambiente,
+            )
+    except Exception as exc:
+        registrar_log(
+            "cdr_importacao_erro",
+            arquivo=str(caminho_dump),
+            id_cliente=id_cliente,
+            comando=" ".join(comando),
+            erro=str(exc),
         )
+        raise
 
     periodo_inicial = None
     periodo_final = None
@@ -83,4 +101,13 @@ def importar_dump_cdr(
     tabela_utilizada = f"{nome_banco_cliente}.cdr"
     tabelas_finais = [tabela_utilizada]
 
+    registrar_log(
+        "cdr_importacao_concluida",
+        arquivo=str(caminho_dump),
+        id_cliente=id_cliente,
+        banco=nome_banco_cliente,
+        total_registros=total_registros,
+        periodo_inicial=periodo_inicial,
+        periodo_final=periodo_final,
+    )
     return periodo_inicial, periodo_final, tabela_utilizada, tabelas_finais, total_registros
