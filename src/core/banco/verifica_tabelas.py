@@ -404,6 +404,8 @@ def criar_tabela_conferencia_execucoes():
         )
         """
     )
+    _garantir_coluna(cursor, "conferencia_execucoes", "mes_referencia", "VARCHAR(6) NULL")
+    _garantir_coluna(cursor, "conferencia_execucoes", "operadoras_json", "TEXT NULL")
     conexao.commit()
     cursor.close()
     conexao.close()

@@ -1,9 +1,15 @@
 # Sobe API (uvicorn) em background e inicia a web (vite) sem perguntas
 import os, subprocess, sys, time, socket
 from pathlib import Path
-from src.core.configuracao_logs import registrar_log
 
 ROOT = Path(__file__).resolve().parent
+PROJETO = ROOT.parent
+if str(PROJETO) not in sys.path:
+    # Permite importar o pacote src mesmo quando rodamos python src/main.py diretamente
+    sys.path.insert(0, str(PROJETO))
+
+from src.core.configuracao_logs import registrar_log
+
 WEB = ROOT / "web"
 API = ROOT / "api"
 
@@ -46,6 +52,7 @@ def start_api():
 def start_web():
     os.chdir(WEB)
     if not (WEB / "node_modules").exists():
+        # Instala dependências do front-end na primeira execução
         subprocess.run(["npm", "install"], check=True)
     env_path = WEB / ".env"
     if not env_path.exists():

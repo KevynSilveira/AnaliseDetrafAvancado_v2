@@ -260,9 +260,9 @@ export default function Validacao() {
   const [importacoes, setImportacoes] = useState([]);
   const [selecionada, setSelecionada] = useState("");
   const [resumo, setResumo] = useState(null);
-const [cdrs, setCdrs] = useState([]);
-const [cdrSelecionado, setCdrSelecionado] = useState("");
-const [forcarNormalizacao, setForcarNormalizacao] = useState(false);
+  const [cdrs, setCdrs] = useState([]);
+  const [cdrSelecionado, setCdrSelecionado] = useState("");
+  const [forcarNormalizacao, setForcarNormalizacao] = useState(false);
   const [lista, setLista] = useState([]);
   const [total, setTotal] = useState(0);
   const [pagina, setPagina] = useState(1);
@@ -300,6 +300,15 @@ const [forcarNormalizacao, setForcarNormalizacao] = useState(false);
   const [graficoSerieAtiva, setGraficoSerieAtiva] = useState("");
   const [graficoFonte, setGraficoFonte] = useState("status");
   const [filtroMultiDivergencias, setFiltroMultiDivergencias] = useState(false);
+  const [validarMesReferencia, setValidarMesReferencia] = useState(false);
+  const [mesReferencia, setMesReferencia] = useState("");
+  const [erroConfiguracao, setErroConfiguracao] = useState("");
+  const [operadorasDisponiveis, setOperadorasDisponiveis] = useState([]);
+  const [buscaOperadora, setBuscaOperadora] = useState("");
+  const [operadorasSelecionadas, setOperadorasSelecionadas] = useState([]);
+  const [carregandoOperadoras, setCarregandoOperadoras] = useState(false);
+  const [mostrarConfigInicial, setMostrarConfigInicial] = useState(true);
+  const [configInicialManual, setConfigInicialManual] = useState(false);
 
   const segmentosGhDetalhe = detalheDados?.detraf?.segmentos_gh || [];
   const partesGhOrigem = detalheDados?.detraf?.partes_gh_origem || [];
@@ -822,6 +831,12 @@ const tooltipCursorStyle = { fill: "rgba(255,255,255,0.04)" };
     []
   );
 
+  const operadorasFiltradas = useMemo(() => {
+    const termo = buscaOperadora.trim().toLowerCase();
+    if (!termo) return operadorasDisponiveis;
+    return operadorasDisponiveis.filter((nome) => nome.toLowerCase().includes(termo));
+  }, [operadorasDisponiveis, buscaOperadora]);
+
   const carregarImportacoes = useCallback(
     async (preservarSelecao = true) => {
       try {
@@ -847,16 +862,47 @@ const tooltipCursorStyle = { fill: "rgba(255,255,255,0.04)" };
     [selecionada]
   );
 
+  const carregarOperadoras = useCallback(async () => {
+    try {
+      setCarregandoOperadoras(true);
+      const lista = await api.get("/api/operadoras");
+      setOperadorasDisponiveis(lista || []);
+    } catch (erro) {
+      setMensagem((msg) => msg || erro.message || "Não foi possível carregar a lista de operadoras.");
+    } finally {
+      setCarregandoOperadoras(false);
+    }
+  }, []);
+
   const importacaoSelecionada = useMemo(
     () => importacoes.find((item) => String(item.id) === String(selecionada)),
     [importacoes, selecionada]
   );
+
+  const alternarOperadora = (nome) => {
+    setOperadorasSelecionadas((lista) =>
+      lista.includes(nome) ? lista.filter((item) => item !== nome) : [...lista, nome]
+    );
+  };
+
+  const removerOperadoraSelecionada = (nome) => {
+    setOperadorasSelecionadas((lista) => lista.filter((item) => item !== nome));
+  };
+
+  const alternarConfigInicial = () => {
+    setConfigInicialManual(true);
+    setMostrarConfigInicial((prev) => !prev);
+  };
 
   const idClienteAtual = importacaoSelecionada?.id_cliente || resumo?.importacao?.id_cliente;
 
   useEffect(() => {
     carregarImportacoes(false);
   }, [carregarImportacoes]);
+
+  useEffect(() => {
+    carregarOperadoras();
+  }, [carregarOperadoras]);
 
   useEffect(() => {
     const intervalo = setInterval(() => {
@@ -894,6 +940,21 @@ const tooltipCursorStyle = { fill: "rgba(255,255,255,0.04)" };
     if (!resumo?.importacao?.id) return;
     setGraficoSerieAtiva("");
   }, [resumo?.importacao?.id]);
+
+  useEffect(() => {
+    if (configInicialManual) return;
+    if (total > 0) {
+      setMostrarConfigInicial(false);
+    } else {
+      setMostrarConfigInicial(true);
+    }
+  }, [total, configInicialManual]);
+
+  useEffect(() => {
+    if (!validarMesReferencia) {
+      setErroConfiguracao("");
+    }
+  }, [validarMesReferencia]);
 
   useEffect(() => {
     setPagina(1);
@@ -1094,19 +1155,29 @@ const tooltipCursorStyle = { fill: "rgba(255,255,255,0.04)" };
       setMensagem("Selecione o DETRAF e o CDR para executar a conferência.");
       return;
     }
+    const mesTrim = mesReferencia.trim();
+    if (validarMesReferencia && !/^\d{6}$/.test(mesTrim)) {
+      setErroConfiguracao("Informe o mês no formato YYYYMM.");
+      setMensagem("Revise o mês de referência antes de rodar a conferência.");
+      return;
+    }
+    setErroConfiguracao("");
     try {
       setMensagem("");
       setExecutando(true);
       setStatusProcesso("Preparando conferência...");
       setStatusExecucao(null);
       setExecucaoId("");
+      const payload = {
+        id_importacao_detraf: Number(selecionada),
+        id_importacao_cdr: Number(cdrSelecionado),
+        forcar_normalizacao: Boolean(forcarNormalizacao),
+        mes_referencia: validarMesReferencia ? mesTrim : null,
+        operadoras: operadorasSelecionadas,
+      };
       const resposta = await api.post(
         "/api/conferencia/processar",
-        {
-          id_importacao_detraf: Number(selecionada),
-          id_importacao_cdr: Number(cdrSelecionado),
-          forcar_normalizacao: Boolean(forcarNormalizacao),
-        },
+        payload,
         { timeout: 30000 }
       );
       const idExec = resposta?.id_execucao;
@@ -1273,12 +1344,114 @@ const tooltipCursorStyle = { fill: "rgba(255,255,255,0.04)" };
                 Recalcula DETRAF e CDR normalizados mesmo que já existam dados salvos — útil após ajustes de código.
               </p>
             </div>
-          </div>
+        </div>
 
-          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-            <p className="text-xs text-gray-500">
-              Dispare o batimento quando ambos os arquivos selecionados estiverem corretos.
-            </p>
+        <div className="rounded-2xl border border-neutral-800 bg-neutral-950/50 p-4 space-y-4">
+          <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-white">Configurações iniciais da conferência</p>
+              <p className="text-xs text-gray-400">
+                Flags opcionais aplicadas antes da execução. Se não configuradas, essas validações são ignoradas.
+              </p>
+            </div>
+            <button className="text-xs text-primary hover:text-primary/80" onClick={alternarConfigInicial}>
+              {mostrarConfigInicial ? "Ocultar" : "Exibir"} configurações
+            </button>
+          </div>
+          {mostrarConfigInicial && (
+            <div className="space-y-6">
+              <div className="space-y-2">
+                <p className="text-xs uppercase tracking-wide text-gray-400">1.1 Flags gerais</p>
+                <label className="flex items-center gap-2 text-sm text-gray-200">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 rounded border-neutral-600 bg-neutral-900 text-primary focus:ring-primary"
+                    checked={validarMesReferencia}
+                    onChange={(e) => setValidarMesReferencia(e.target.checked)}
+                  />
+                  Validar mês de referência (YYYYMM)
+                </label>
+                <input
+                  type="text"
+                  placeholder="Ex: 202508"
+                  value={mesReferencia}
+                  onChange={(e) => setMesReferencia(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))}
+                  disabled={!validarMesReferencia}
+                  className="w-full rounded-lg border border-neutral-700 bg-dark px-3 py-2 text-sm text-gray-200 disabled:opacity-60"
+                />
+                {erroConfiguracao && <p className="text-xs text-red-400">{erroConfiguracao}</p>}
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-xs uppercase tracking-wide text-gray-400">1.2 Seleção de operadora(s)</p>
+                  {operadorasSelecionadas.length > 0 && (
+                    <button
+                      className="text-xs text-primary hover:text-white"
+                      type="button"
+                      onClick={() => setOperadorasSelecionadas([])}
+                    >
+                      Limpar seleção
+                    </button>
+                  )}
+                </div>
+                <input
+                  type="text"
+                  placeholder="Buscar operadora"
+                  value={buscaOperadora}
+                  onChange={(e) => setBuscaOperadora(e.target.value)}
+                  className="w-full rounded-lg border border-neutral-700 bg-dark px-3 py-2 text-sm text-gray-200"
+                />
+                <div className="max-h-48 space-y-2 overflow-y-auto rounded-lg border border-neutral-800 bg-neutral-950/60 p-3 text-sm text-gray-200">
+                  {carregandoOperadoras ? (
+                    <p className="text-xs text-gray-500">Carregando operadoras...</p>
+                  ) : operadorasFiltradas.length ? (
+                    operadorasFiltradas.map((nome) => (
+                      <label key={nome} className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          className="h-4 w-4 rounded border-neutral-600 bg-neutral-900 text-primary focus:ring-primary"
+                          checked={operadorasSelecionadas.includes(nome)}
+                          onChange={() => alternarOperadora(nome)}
+                        />
+                        <span>{nome}</span>
+                      </label>
+                    ))
+                  ) : (
+                    <p className="text-xs text-gray-500">Nenhuma operadora encontrada.</p>
+                  )}
+                </div>
+                {operadorasSelecionadas.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {operadorasSelecionadas.map((nome) => (
+                      <span
+                        key={nome}
+                        className="inline-flex items-center gap-2 rounded-full border border-primary/40 bg-primary/10 px-3 py-1 text-xs text-primary"
+                      >
+                        {nome}
+                        <button
+                          type="button"
+                          className="text-primary hover:text-white"
+                          onClick={() => removerOperadoraSelecionada(nome)}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <p className="text-xs text-gray-500">
+                  Caso nenhuma operadora seja selecionada, a validação por operadora será ignorada automaticamente.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+          <p className="text-xs text-gray-500">
+            Dispare o batimento quando ambos os arquivos selecionados estiverem corretos.
+          </p>
             <button className="btn" onClick={executarConferencia} disabled={executando || !selecionada || !cdrSelecionado}>
               {executando ? "Processando..." : "Rodar conferência"}
             </button>

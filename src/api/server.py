@@ -13,6 +13,7 @@ import json
 import os
 import re
 import threading
+import subprocess
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -84,6 +85,12 @@ VAR_DIR = BASE_DIR / os.getenv("VAR_DIR", "var")
 LOG_DIR = VAR_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+TABELAS_AUXILIARES = {
+    "eot": "eot",
+    "numeros_portados": "numeros_portados",
+    "cadup": "cadup",
+}
+
 # ======================================
 # Logging centralizado
 # ======================================
@@ -126,6 +133,71 @@ def _coluna_existe(tabela: str, coluna: str) -> bool:
     finally:
         conexao.close()
 
+
+def criar_tabela_importacoes_auxiliares():
+    """Cria histórico para dumps auxiliares (EOT, números portados, CADUP)."""
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS importacoes_auxiliares (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                tabela_alvo ENUM('eot','numeros_portados','cadup') NOT NULL,
+                nome_arquivo VARCHAR(255) NOT NULL,
+                tamanho_bytes BIGINT NULL,
+                total_registros INT NULL,
+                status ENUM('PROCESSANDO','CONCLUIDO','ERRO') DEFAULT 'PROCESSANDO',
+                mensagem TEXT NULL,
+                criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conexao.commit()
+    finally:
+        conexao.close()
+
+
+def registrar_importacao_auxiliar_inicio(tabela: str, nome_arquivo: str, tamanho_bytes: Optional[int]) -> int:
+    """Grava início da importação auxiliar para exibir no histórico."""
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(
+            """
+            INSERT INTO importacoes_auxiliares (tabela_alvo, nome_arquivo, tamanho_bytes)
+            VALUES (%s, %s, %s)
+            """,
+            (tabela, nome_arquivo, tamanho_bytes),
+        )
+        conexao.commit()
+        return cursor.lastrowid
+    finally:
+        conexao.close()
+
+
+def atualizar_importacao_auxiliar(id_registro: int, **campos):
+    """Atualiza status/mensagem da importação auxiliar."""
+    if not campos:
+        return
+    colunas = []
+    valores = []
+    for chave, valor in campos.items():
+        colunas.append(f"{chave} = %s")
+        valores.append(valor)
+    valores.append(id_registro)
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(
+            f"UPDATE importacoes_auxiliares SET {', '.join(colunas)} WHERE id = %s",
+            tuple(valores),
+        )
+        conexao.commit()
+    finally:
+        conexao.close()
+
 # ======================================
 # Inicialização do Banco
 # ======================================
@@ -139,6 +211,7 @@ def ensure_tables():
     criar_tabela_detraf_normalizado()
     criar_tabela_cdr_normalizado()
     criar_tabela_conferencia_resultados()
+    criar_tabela_importacoes_auxiliares()
     _coluna_existe.cache_clear()
 
 ensure_tables()
@@ -189,6 +262,8 @@ class ConferenciaProcessarEntrada(BaseModel):
     id_importacao_detraf: int
     id_importacao_cdr: Optional[int] = None
     forcar_normalizacao: bool = False
+    mes_referencia: Optional[str] = None
+    operadoras: Optional[List[str]] = None
 
 
 def atualizar_controle_importacao(id_importacao: int, **campos):
@@ -246,16 +321,23 @@ def registrar_tabelas_cdr(id_importacao: int, tabelas: List[str]) -> None:
         conexao.close()
 
 
-def registrar_execucao_conferencia(id_cliente: int, id_importacao_detraf: int, id_importacao_cdr: Optional[int]) -> int:
+def registrar_execucao_conferencia(
+    id_cliente: int,
+    id_importacao_detraf: int,
+    id_importacao_cdr: Optional[int],
+    mes_referencia: Optional[str] = None,
+    operadoras: Optional[List[str]] = None,
+) -> int:
+    operadoras_json = json.dumps(operadoras, ensure_ascii=False) if operadoras else None
     conexao = db()
     try:
         cursor = conexao.cursor()
         cursor.execute(
             """
-            INSERT INTO conferencia_execucoes (id_cliente, id_importacao_detraf, id_importacao_cdr)
-            VALUES (%s, %s, %s)
+            INSERT INTO conferencia_execucoes (id_cliente, id_importacao_detraf, id_importacao_cdr, mes_referencia, operadoras_json)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (id_cliente, id_importacao_detraf, id_importacao_cdr),
+            (id_cliente, id_importacao_detraf, id_importacao_cdr, mes_referencia, operadoras_json),
         )
         conexao.commit()
         return cursor.lastrowid
@@ -1036,6 +1118,21 @@ def get_import(imp_id: int):
         conexao.close()
 
 
+@app.get("/api/operadoras")
+def listar_operadoras():
+    """Retorna a lista distinta de operadoras cadastradas na tabela EOT."""
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(
+            "SELECT DISTINCT nome_fantasia FROM eot WHERE nome_fantasia IS NOT NULL AND nome_fantasia <> '' ORDER BY nome_fantasia ASC"
+        )
+        registros = cursor.fetchall()
+        return [linha[0] for linha in registros if linha and linha[0]]
+    finally:
+        conexao.close()
+
+
 @app.post("/api/imports")
 def upload_import(
     id_cliente: int = Form(...),
@@ -1209,6 +1306,164 @@ def upload_import(
     ).start()
 
     return {"id": id_importacao, "mensagem": "Importação registrada com sucesso."}
+
+
+def _montar_comando_mysql():
+    comando = ["mysql"]
+    if DBCFG.get("host"):
+        comando.extend(["-h", str(DBCFG["host"])])
+    if DBCFG.get("port"):
+        comando.extend(["-P", str(DBCFG["port"])])
+    if DBCFG.get("user"):
+        comando.extend(["-u", str(DBCFG["user"])])
+    ambiente = os.environ.copy()
+    if DBCFG.get("password"):
+        ambiente["MYSQL_PWD"] = str(DBCFG["password"])
+    if not DBCFG.get("database"):
+        raise RuntimeError("Banco padrão não configurado para importação.")
+    comando.extend(["-D", str(DBCFG["database"])])
+    return comando, ambiente
+
+
+def _contar_registros_tabela(nome_tabela: str) -> Optional[int]:
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(f"SELECT COUNT(1) FROM `{nome_tabela}`")
+        resultado = cursor.fetchone()
+        return int(resultado[0]) if resultado and resultado[0] is not None else None
+    except mysql.Error:
+        return None
+    finally:
+        conexao.close()
+
+
+def _importar_tabela_auxiliar(nome_tabela: str, caminho: Path) -> dict:
+    registrar_log(
+        "auxiliar_importacao_inicio",
+        tabela=nome_tabela,
+        arquivo=str(caminho),
+        tamanho_bytes=caminho.stat().st_size if caminho.exists() else None,
+    )
+    conexao = db()
+    try:
+        cursor = conexao.cursor()
+        cursor.execute(f"DROP TABLE IF EXISTS `{nome_tabela}`")
+        conexao.commit()
+    finally:
+        conexao.close()
+
+    comando, ambiente = _montar_comando_mysql()
+    try:
+        with open(caminho, "rb") as conteudo:
+            resultado = subprocess.run(
+                comando,
+                stdin=conteudo,
+                check=False,
+                env=ambiente,
+                capture_output=True,
+            )
+    except OSError as exc:
+        registrar_log(
+            "auxiliar_importacao_erro",
+            tabela=nome_tabela,
+            arquivo=str(caminho),
+            erro=str(exc),
+        )
+        raise RuntimeError("Falha ao executar comando mysql.") from exc
+
+    if resultado.returncode != 0:
+        registrar_log(
+            "auxiliar_importacao_erro",
+            tabela=nome_tabela,
+            arquivo=str(caminho),
+            returncode=resultado.returncode,
+            stderr=resultado.stderr.decode(errors="ignore") if resultado.stderr else "",
+        )
+        raise RuntimeError(f"Comando mysql retornou código {resultado.returncode}.")
+
+    total_registros = _contar_registros_tabela(nome_tabela)
+    registrar_log(
+        "auxiliar_importacao_concluida",
+        tabela=nome_tabela,
+        arquivo=str(caminho),
+        total_registros=total_registros,
+    )
+    return {
+        "tabela": nome_tabela,
+        "total_registros": total_registros,
+    }
+
+
+@app.post("/api/importacoes/auxiliares/{tabela_id}")
+def importar_tabela_auxiliar_endpoint(tabela_id: str, arquivo: UploadFile = File(...)):
+    """Recebe dumps auxiliares (.sql), substitui a tabela alvo e registra histórico."""
+    tabela = (tabela_id or "").strip().lower()
+    if tabela not in TABELAS_AUXILIARES:
+        raise HTTPException(status_code=400, detail="Tabela auxiliar inválida.")
+
+    nome_original = arquivo.filename or "dump.sql"
+    if not nome_original.lower().endswith(".sql"):
+        raise HTTPException(status_code=400, detail="Envie arquivos no formato .sql.")
+
+    destino = VAR_DIR / "tmp" / f"{datetime.now():%Y%m%d%H%M%S}_{tabela}_{Path(nome_original).name}"
+    with open(destino, "wb") as saida:
+        while chunk := arquivo.file.read(1024 * 1024):
+            saida.write(chunk)
+    arquivo.file.close()
+
+    tamanho = destino.stat().st_size if destino.exists() else None
+    registro_id = registrar_importacao_auxiliar_inicio(tabela, nome_original, tamanho)
+    try:
+        resultado = _importar_tabela_auxiliar(tabela, destino)
+        total = resultado.get("total_registros")
+        atualizar_importacao_auxiliar(
+            registro_id,
+            status="CONCLUIDO",
+            total_registros=total,
+            mensagem="Importação concluída com sucesso.",
+        )
+        resposta = {
+            "tabela": tabela,
+            "arquivo": nome_original,
+            "tamanho_bytes": tamanho,
+            "total_registros": total,
+            "mensagem": "Importação concluída com sucesso.",
+        }
+        return resposta
+    except Exception as exc:
+        atualizar_importacao_auxiliar(
+            registro_id,
+            status="ERRO",
+            mensagem=str(exc),
+        )
+        raise HTTPException(status_code=500, detail=f"Falha ao importar tabela {tabela.upper()}: {exc}")
+    finally:
+        try:
+            if destino.exists():
+                destino.unlink()
+        except OSError:
+            pass
+
+
+@app.get("/api/importacoes/auxiliares")
+def listar_importacoes_auxiliares():
+    """Histórico completo dos uploads auxiliares, usado na aba da web."""
+    conexao = db()
+    try:
+        cursor = conexao.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id, tabela_alvo, nome_arquivo, tamanho_bytes, total_registros,
+                   status, mensagem, criado_em, atualizado_em
+            FROM importacoes_auxiliares
+            ORDER BY criado_em DESC, id DESC
+            LIMIT 100
+            """
+        )
+        return cursor.fetchall()
+    finally:
+        conexao.close()
 
 
 # ======================================
@@ -1867,6 +2122,16 @@ def obter_conferencia_resultado(resultado_id: int):
 
 @app.post("/api/conferencia/processar")
 def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
+    mes_referencia = (entrada.mes_referencia or "").strip()
+    if mes_referencia and not re.fullmatch(r"\d{6}", mes_referencia):
+        raise HTTPException(status_code=400, detail="Mês de referência inválido. Utilize o formato YYYYMM.")
+    operadoras_limpas: List[str] = []
+    if entrada.operadoras:
+        for valor in entrada.operadoras:
+            nome = (valor or "").strip()
+            if nome and nome not in operadoras_limpas:
+                operadoras_limpas.append(nome)
+
     detraf = _obter_importacao(entrada.id_importacao_detraf)
     if not detraf or detraf.get("tipo_arquivo") != "DETRAF":
         raise HTTPException(status_code=404, detail="Importação DETRAF não encontrada.")
@@ -1893,7 +2158,13 @@ def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
     periodo_inicio = detraf.get("periodo_inicial") or cdr.get("periodo_inicial")
     periodo_fim = detraf.get("periodo_final") or cdr.get("periodo_final")
 
-    exec_id = registrar_execucao_conferencia(id_cliente, detraf["id"], cdr["id"])
+    exec_id = registrar_execucao_conferencia(
+        id_cliente,
+        detraf["id"],
+        cdr["id"],
+        mes_referencia=mes_referencia or None,
+        operadoras=operadoras_limpas or None,
+    )
     callback = _callback_execucao(exec_id)
 
     registrar_log(
@@ -1903,6 +2174,8 @@ def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
         id_importacao_detraf=detraf["id"],
         id_importacao_cdr=cdr["id"],
         forcar_normalizacao=entrada.forcar_normalizacao,
+        mes_referencia=mes_referencia or None,
+        operadoras=operadoras_limpas,
     )
 
     def _rodar_conferencia():
@@ -1931,6 +2204,8 @@ def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
                 id_importacao_detraf=detraf["id"],
                 id_importacao_cdr=cdr["id"],
                 forcar_normalizacao=entrada.forcar_normalizacao,
+                mes_referencia=mes_referencia or None,
+                operadoras=operadoras_limpas,
                 resumo=resumo,
             )
         except Exception as exc:
@@ -1946,6 +2221,8 @@ def processar_conferencia_manual(entrada: ConferenciaProcessarEntrada):
                 id_importacao_detraf=detraf["id"],
                 id_importacao_cdr=cdr["id"],
                 forcar_normalizacao=entrada.forcar_normalizacao,
+                mes_referencia=mes_referencia or None,
+                operadoras=operadoras_limpas,
                 erro=str(exc),
             )
 
